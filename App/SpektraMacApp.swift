@@ -5,27 +5,34 @@ import SwiftUI
 struct SpektraMacApp: App {
     @NSApplicationDelegateAdaptor private var delegate: AppDelegate
     private var model: PhotoModel { delegate.model }
+    private var library: LibraryModel { delegate.library }
 
     var body: some Scene {
         Window("SpektraMac", id: "main") {
-            ContentView()
+            WorkspaceView()
                 .environment(model)
+                .environment(library)
         }
         .defaultSize(width: 1100, height: 760)
         .commands {
             // Nothing here prints.
             CommandGroup(replacing: .printItem) {}
             CommandGroup(after: .newItem) {
-                Button("Open…", systemImage: "folder") { model.isImporting = true }
+                Button("Import Photos…", systemImage: "plus") { library.presentImport() }
                     .keyboardShortcut("o", modifiers: .command)
                 Menu("Open Recent", systemImage: "clock") {
                     ForEach(model.recentPhotos, id: \.self) { url in
-                        Button(url.lastPathComponent) { model.open(url) }
+                        Button(url.lastPathComponent) { library.importAndEdit([url]) }
                     }
                     Divider()
                     Button("Clear Menu") { model.clearRecentPhotos() }
                         .disabled(model.recentPhotos.isEmpty)
                 }
+                Divider()
+                Button("New Project…") { library.newProject() }
+                    .keyboardShortcut("n", modifiers: [.command, .shift])
+                Button("Open Project…") { library.openProject() }
+                Button("Save Project") { library.saveProject() }
                 Divider()
                 Button("Save…", systemImage: "square.and.arrow.down") { model.save() }
                     .keyboardShortcut("s", modifiers: .command)
@@ -39,6 +46,14 @@ struct SpektraMacApp: App {
             }
             InspectorCommands()
             ViewCommands(model: model)
+            CommandMenu("Photo") {
+                Button("Previous Photo") { library.editNeighbour(-1) }
+                    .keyboardShortcut(.leftArrow, modifiers: .command)
+                    .disabled(library.step != .edit)
+                Button("Next Photo") { library.editNeighbour(1) }
+                    .keyboardShortcut(.rightArrow, modifiers: .command)
+                    .disabled(library.step != .edit)
+            }
             // The user guide on GitHub: there's no help book.
             CommandGroup(replacing: .help) {
                 Link("SpektraMac Help", destination: URL(string: "https://github.com/nainajnahO/SpektraMac/blob/main/docs/guide.md")!)
@@ -125,6 +140,7 @@ struct ViewCommands: Commands {
 /// next launch.
 final class AppDelegate: NSObject, NSApplicationDelegate {
     let model = PhotoModel()
+    lazy var library = LibraryModel(photos: model)
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard let phase = model.savePhase else { return .terminateNow }
@@ -136,7 +152,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return alert.runModal() == .alertFirstButtonReturn ? .terminateCancel : .terminateNow
     }
 
+    /// Photos sent by Finder's Open With and the Dock icon (the app's document types), all at once:
+    /// imported, and the first opened in Edit.
+    func application(_ application: NSApplication, open urls: [URL]) {
+        library.importAndEdit(urls)
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
         model.storeSettings()
+        library.saveNow()
     }
 }

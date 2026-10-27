@@ -20,6 +20,8 @@ final class PhotoModel {
     /// metering marks found in it.
     struct Photo: Identifiable {
         let id = UUID()
+        /// The file it was opened from, which the library knows it by.
+        let url: URL
         let name: String
         let width: Int
         let height: Int
@@ -57,8 +59,17 @@ final class PhotoModel {
             if controlsBeforeChange == nil && controls != oldValue {
                 registerUndo(from: oldValue)
             }
+            if controls != oldValue, !isApplyingPhotoControls, let photo {
+                onControlsChanged?(photo.url, controls)
+            }
         }
     }
+    /// Told the open photo's new controls at each change, so the library keeps each photo's own.
+    @ObservationIgnored var onControlsChanged: ((URL, Controls) -> Void)?
+    /// While a photo's own settings, or the app's last ones, are applied: not a change to report.
+    @ObservationIgnored private var isApplyingPhotoControls = false
+    /// Told each finished screen-size render of the open photo, for the library's thumbnails.
+    @ObservationIgnored var onFinishedRender: ((URL, CGImage) -> Void)?
     /// What the toolbar's Print | Film switch shows, as the controls have it: apart from them, so
     /// the switch isn't laid out again at every step of a slider (setting an observed property to
     /// the value it has notifies no one).
@@ -77,7 +88,8 @@ final class PhotoModel {
     func controls(choosing film: String) -> Controls {
         savedDefaults(for: film) ?? factoryControls(for: film, from: controls)
     }
-    var filmName: String { films.first { $0.stock == controls.film }?.name ?? controls.film }
+    var filmName: String { filmName(of: controls) }
+    func filmName(of controls: Controls) -> String { films.first { $0.stock == controls.film }?.name ?? controls.film }
     var paperName: String { papers.first { $0.stock == controls.paper }?.name ?? controls.paper }
     var films: [ProfileInfo] { engine?.films ?? [] }
     var papers: [ProfileInfo] { engine?.papers ?? [] }
@@ -198,8 +210,6 @@ final class PhotoModel {
     /// Why there's no engine: Metal is unavailable. The empty canvas says so.
     private(set) var engineFailure: String?
     private(set) var log: [LogEntry] = []
-    /// Drives the Open panel (`fileImporter`); ⌘O and the toolbar set it.
-    var isImporting = false
     /// Drives the Open Preset panel (`fileImporter`); its menu item sets it.
     var isImportingPreset = false
 
@@ -244,7 +254,9 @@ final class PhotoModel {
             if let start = lastSettings() ?? savedDefaults(for: controls.film) {
                 // Where the app starts, not an edit to undo.
                 undoManager?.disableUndoRegistration()
+                isApplyingPhotoControls = true
                 controls = start
+                isApplyingPhotoControls = false
                 undoManager?.enableUndoRegistration()
             }
             // On the engine's queue, so the first photo opened doesn't wait for it.
@@ -275,7 +287,7 @@ final class PhotoModel {
     /// a moment), and one the engine is already opening shows until the later one replaces it.
     /// "Opening…" stays until the newest is done. An opened photo goes to the top of
     /// ``recentPhotos``.
-    func open(_ url: URL) {
+    func open(_ url: URL, controls photoControls: Controls? = nil) {
         // Files from the Open panel and Open Recent are security-scoped; dropped files and those
         // sent by Finder or the Dock are already accessible.
         let scoped = url.startAccessingSecurityScopedResource()
@@ -310,7 +322,17 @@ final class PhotoModel {
                     throw error
                 }
                 self.metadata = metadata
-                photo = Photo(name: url.lastPathComponent, width: opened.width, height: opened.height,
+                // The photo's own settings, if the library has them; otherwise the last ones carry
+                // over. Undo stays with the photo it was done on.
+                undoManager?.removeAllActions()
+                if let photoControls, knowsStocks(of: photoControls) {
+                    undoManager?.disableUndoRegistration()
+                    isApplyingPhotoControls = true
+                    controls = checked(photoControls)
+                    isApplyingPhotoControls = false
+                    undoManager?.enableUndoRegistration()
+                }
+                photo = Photo(url: url, name: url.lastPathComponent, width: opened.width, height: opened.height,
                               previewWidth: opened.previewWidth, previewHeight: opened.previewHeight,
                               metering: opened.metering, meteringOverlays: opened.meteringOverlays)
                 note("Opened \(url.lastPathComponent) (\(opened.width) × \(opened.height))")
@@ -497,6 +519,7 @@ final class PhotoModel {
         if case .reduced(let longSide) = mode {
             finishedRenders.setObject(display, forKey: RenderKey(controls: controls, longSide: longSide),
                                       cost: display.bytesPerRow * display.height)
+            onFinishedRender?(photo.url, display)
         }
         let elapsed = (ContinuousClock.now - start).formatted(.units(allowed: [.milliseconds]))
         let size = mode == .full ? "\(photo.width) × \(photo.height)" : "\(display.width) × \(display.height)"
@@ -737,6 +760,74 @@ final class PhotoModel {
         }
     }
 
+    /// A photo for ``exportPhotos(_:to:as:)``: its file, its settings and the name to save it as.
+    struct ExportJob {
+        let url: URL
+        let controls: Controls
+        let name: String
+    }
+
+    /// Renders each job at full resolution and writes it into `folder` as `type`, one at a time on
+    /// the engine, which holds one photo: the open photo opens again after. Cancel stops it after
+    /// the photo rendering. Returns how many were written.
+    func exportPhotos(_ jobs: [ExportJob], to folder: URL, as type: UTType) async -> Int {
+        guard let engine, savePhase == nil else { return 0 }
+        let reopen = photo.map { ($0.url, controls) }
+        stopRendering()
+        stripTask?.cancel()
+        stripTask = nil
+        stopPreloading()
+        var written = 0
+        let task = Task {
+            let folderScoped = folder.startAccessingSecurityScopedResource()
+            defer { if folderScoped { folder.stopAccessingSecurityScopedResource() } }
+            let ext = type.preferredFilenameExtension ?? "jpg"
+            for (index, job) in jobs.enumerated() {
+                if Task.isCancelled { break }
+                savePhase = "Exporting \(index + 1) of \(jobs.count): \(job.name)…"
+                let scoped = job.url.startAccessingSecurityScopedResource()
+                defer { if scoped { job.url.stopAccessingSecurityScopedResource() } }
+                do {
+                    let (image, metadata) = try await Task.detached(priority: .userInitiated) {
+                        (try RGBImage.decode(contentsOf: job.url), PhotoMetadata(contentsOf: job.url))
+                    }.value
+                    _ = try await engine.open(image)
+                    let rendered = try await engine.export(controls: checked(job.controls), as: type)
+                    let record = editRecord(for: job.controls)
+                    let destination = Self.unusedURL(in: folder, name: job.name, extension: ext)
+                    try await Task.detached(priority: .userInitiated) {
+                        try rendered.write(to: destination, as: type, metadata: metadata, record: record)
+                    }.value
+                    written += 1
+                    note("Exported \(destination.lastPathComponent)")
+                } catch is CancellationError {
+                    break
+                } catch {
+                    fail("Couldn't export “\(job.url.lastPathComponent)”", error)
+                }
+            }
+        }
+        saveTask = task
+        await task.value
+        savePhase = nil
+        saveTask = nil
+        if let (url, controls) = reopen {
+            open(url, controls: controls)
+        }
+        return written
+    }
+
+    /// `name.ext` in `folder`, or `name 2.ext` and so on if that's taken.
+    nonisolated private static func unusedURL(in folder: URL, name: String, extension ext: String) -> URL {
+        var candidate = folder.appending(path: "\(name).\(ext)")
+        var number = 2
+        while FileManager.default.fileExists(atPath: candidate.path(percentEncoded: false)) {
+            candidate = folder.appending(path: "\(name) \(number).\(ext)")
+            number += 1
+        }
+        return candidate
+    }
+
     /// Stops a save; the GPU stops at its next memory flush.
     func cancel() {
         saveTask?.cancel()
@@ -766,12 +857,18 @@ final class PhotoModel {
 
     /// What a saved photo records of its edit: the film and paper (or the film, scanned), the
     /// exposure as the slider shows it and the adjustments switched on, by their sidebar names.
-    private var editRecord: EditRecord {
+    private var editRecord: EditRecord { editRecord(for: controls) }
+
+    private func editRecord(for controls: Controls) -> EditRecord {
+        let filmName = films.first { $0.stock == controls.film }?.name ?? controls.film
+        let paperName = papers.first { $0.stock == controls.paper }?.name ?? controls.paper
         func diffusion(_ filter: Parameters.DiffusionFilter.Family, _ strength: Double, on lens: String) -> String {
             "\(filter.name) \(strength.formatted(.number.precision(.fractionLength(0...3)))) on the \(lens)"
         }
-        var summary = [controls.scanFilm ? "\(filmName), scanned" : "\(filmName) printed on \(paperName)",
-                       "\(exposureText) EV"]
+        var summary = [controls.scanFilm ? "\(filmName), scanned" : "\(filmName) printed on \(paperName)"]
+        if controls == self.controls {
+            summary.append("\(exposureText) EV")
+        }
         if controls.cameraDiffusion.active {
             summary.append(diffusion(controls.cameraDiffusion.filterFamily, controls.cameraDiffusion.strength, on: "lens"))
         }

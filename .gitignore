@@ -7,3 +7,4 @@ DerivedData/
 __pycache__/
 golden/*
 !golden/manifest.json
+build/

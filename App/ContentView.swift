@@ -5,6 +5,7 @@ import UniformTypeIdentifiers
 
 struct ContentView: View {
     @Environment(PhotoModel.self) private var model
+    @Environment(LibraryModel.self) private var library
     @Environment(\.openWindow) private var openWindow
     @Environment(\.undoManager) private var undoManager
     @SceneStorage("showsSettings") private var showsSettings = true
@@ -14,6 +15,9 @@ struct ContentView: View {
     var body: some View {
         @Bindable var model = model
         ImageCanvas()
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                if !library.items.isEmpty { Filmstrip() }
+            }
             // Focused from the start, as nothing else in the window takes focus on a click, so
             // Edit › Copy (⌘C) reaches it: the finished photo, as Share sends it.
             .focusable()
@@ -24,11 +28,11 @@ struct ContentView: View {
             .navigationTitle(model.photo?.name ?? "SpektraMac")
             .navigationSubtitle(status)
             .toolbar {
-                ToolbarItemGroup(placement: .principal) {
+                ToolbarItemGroup {
                     ShowPicker()
                 }
                 ToolbarItemGroup {
-                    Button("Open…", systemImage: "folder") { model.isImporting = true }
+                    Button("Import Photos…", systemImage: "plus") { library.presentImport() }
                     Button("Save…", systemImage: "square.and.arrow.down") { model.save() }
                         .disabled(!model.canSave)
                     shareButton
@@ -68,18 +72,10 @@ struct ContentView: View {
             .focusedSceneValue(\.settingsCategory, $category)
             .focusedSceneValue(\.showsSettings, $showsSettings)
             .dropDestination(for: URL.self) { urls, _ in
-                guard let url = urls.first else { return false }
-                model.open(url)
+                guard !urls.isEmpty else { return false }
+                library.importAndEdit(urls)
                 return true
             }
-            // Photos sent by Finder's Open With and the Dock icon (the app's document types).
-            .onOpenURL { url in model.open(url) }
-        .fileImporter(isPresented: $model.isImporting, allowedContentTypes: [.image]) { result in
-            switch result {
-            case .success(let url): model.open(url)
-            case .failure(let error): model.importFailed(error)
-            }
-        }
         .fileImporter(isPresented: $model.isImportingPreset, allowedContentTypes: [.json]) { result in
             switch result {
             case .success(let url): model.openPreset(url)
@@ -169,6 +165,7 @@ private struct ShowPicker: View {
 /// reaches under the toolbar and the panel, so a zoomed photo shows through them, as in Photos.
 private struct ImageCanvas: View {
     @Environment(PhotoModel.self) private var model
+    @Environment(LibraryModel.self) private var library
     /// Magnification over the photo fitted to the canvas (1 shows all of it), and how far the
     /// zoomed photo is moved from the centre, in points.
     @State private var zoom: CGFloat = 1
@@ -210,7 +207,7 @@ private struct ImageCanvas: View {
                         } description: {
                             Text("Drop a photo here or open one to simulate it on film.")
                         } actions: {
-                            Button("Open…") { model.isImporting = true }
+                            Button("Import Photos…") { library.presentImport() }
                         }
                     }
                 }

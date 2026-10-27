@@ -20,8 +20,10 @@ enum InputGamutCompression {
             let (i0, j0) = (min(Int(tc.x.rounded(.down)), size - 1), min(Int(tc.y.rounded(.down)), size - 1))
             let (i1, j1) = (min(i0 + 1, size - 1), min(j0 + 1, size - 1))
             let (fi, fj) = (tc.x - tc.x.rounded(.down), tc.y - tc.y.rounded(.down))
-            return lut[i0 * size + j0] * ((1 - fi) * (1 - fj)) + lut[i0 * size + j1] * ((1 - fi) * fj)
-                + lut[i1 * size + j0] * (fi * (1 - fj)) + lut[i1 * size + j1] * (fi * fj)
+            let w00: Double = (1 - fi) * (1 - fj), w01: Double = (1 - fi) * fj
+            let w10: Double = fi * (1 - fj), w11: Double = fi * fj
+            let top = lut[i0 * size + j0] * w00 + lut[i0 * size + j1] * w01
+            return top + lut[i1 * size + j0] * w10 + lut[i1 * size + j1] * w11
         }
     }
 
@@ -85,7 +87,7 @@ func quadToTri(_ tc: SIMD2<Double>) -> SIMD2<Double> {
 /// per-pixel part runs on the GPU (``GPU/encodeOutputCompression(_:maxChroma:on:rgb:)``).
 struct OutputGamutCompression {
     /// The table's J' grid, `np.linspace(1, 110, 64)`: J' ≈ 100 at white, a little headroom above.
-    static let lightnessGrid = (0..<64).map { $0 == 63 ? 110 : Double($0) * (109.0 / 63) + 1 }
+    static let lightnessGrid: [Double] = (0..<64).map { (i: Int) -> Double in i == 63 ? 110 : Double(i) * (109.0 / 63) + 1 }
     /// The table's h' grid in radians, `np.linspace(-π, π, 720, endpoint=False)`.
     static let hueGrid = (0..<720).map { Double($0) * (2 * .pi / 720) - .pi }
 
