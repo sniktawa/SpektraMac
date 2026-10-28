@@ -133,7 +133,10 @@ final class LibraryModel {
             return
         }
         currentID = item.id
-        selection = [item.id]
+        // Keeps a selection the photo is in, so it's still there to export.
+        if !selection.contains(item.id) {
+            selection = [item.id]
+        }
         let controls = item.controlsPreset.flatMap { try? Controls(preset: $0) } ?? photos.startingControls()
         // The next photo first, as photos are mostly stepped through forwards.
         let shown = shownItems

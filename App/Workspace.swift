@@ -71,6 +71,9 @@ private struct StepPicker: View {
 struct LibraryView: View {
     @Environment(LibraryModel.self) private var library
     @State private var isDropTargeted = false
+    /// The photo a ⇧-click selects the run from: the last one clicked.
+    @State private var selectionAnchor: LibraryItem.ID?
+    @AppStorage("exportScope") private var exportScope = ExportView.Scope.edited.rawValue
 
     var body: some View {
         @Bindable var library = library
@@ -146,14 +149,27 @@ struct LibraryView: View {
                 ForEach(shown) { item in
                     ThumbnailCell(item: item, size: library.thumbnailSize,
                                   isSelected: library.selection.contains(item.id))
-                        .onTapGesture(count: 2) { library.edit(item) }
-                        .onTapGesture { select(item, in: shown) }
+                        // One gesture, not a double tap and a single one: the single one would wait out
+                        // the double-click time, by which ⌘ or ⇧ may be let go.
+                        .onTapGesture {
+                            let event = NSApp.currentEvent
+                            if event?.clickCount == 2 {
+                                library.edit(item)
+                            } else {
+                                select(item, in: shown, modifiers: event?.modifierFlags ?? [])
+                            }
+                        }
                         .contextMenu { menu(for: item) }
                 }
             }
             .padding(14)
         }
         .background(.black.opacity(0.03))
+        .onKeyPress(characters: ["a"]) { press in
+            guard press.modifiers == .command else { return .ignored }
+            library.selection = Set(shown.map(\.id))
+            return .handled
+        }
         .onKeyPress(.return) {
             guard let item = shown.first(where: { library.selection.contains($0.id) }) else { return .ignored }
             library.edit(item)
@@ -162,22 +178,31 @@ struct LibraryView: View {
         .onDeleteCommand { library.remove(library.selection) }
     }
 
-    /// Click selects one, ⌘-click adds or removes, ⇧-click selects the run from the last.
-    private func select(_ item: LibraryItem, in shown: [LibraryItem]) {
-        let flags = NSEvent.modifierFlags
-        if flags.contains(.command) {
+    /// Click selects one, ⌘-click adds or removes, ⇧-click selects the run from the last one clicked.
+    private func select(_ item: LibraryItem, in shown: [LibraryItem], modifiers: NSEvent.ModifierFlags) {
+        if modifiers.contains(.command) {
             if library.selection.contains(item.id) { library.selection.remove(item.id) } else { library.selection.insert(item.id) }
-        } else if flags.contains(.shift), let anchor = shown.firstIndex(where: { library.selection.contains($0.id) }),
+            selectionAnchor = item.id
+        } else if modifiers.contains(.shift),
+                  let anchor = shown.firstIndex(where: { $0.id == selectionAnchor })
+                      ?? shown.firstIndex(where: { library.selection.contains($0.id) }),
                   let index = shown.firstIndex(of: item) {
-            library.selection = Set(shown[min(anchor, index)...max(anchor, index)].map(\.id))
+            library.selection.formUnion(shown[min(anchor, index)...max(anchor, index)].map(\.id))
         } else {
             library.selection = [item.id]
+            selectionAnchor = item.id
         }
     }
 
     @ViewBuilder private func menu(for item: LibraryItem) -> some View {
         let ids = library.selection.contains(item.id) ? library.selection : [item.id]
         Button("Edit") { library.edit(item) }
+        Button("Export \(ids.count == 1 ? "Photo" : "\(ids.count) Photos")…") {
+            library.selection = ids
+            exportScope = ExportView.Scope.selected.rawValue
+            library.go(to: .export)
+        }
+        Button("Select All") { library.selection = Set(library.shownItems.map(\.id)) }
         Button("Show in Finder") { library.showInFinder(ids) }
         Divider()
         Button("Copy Edits") { library.selection = ids; library.copyEdits() }
@@ -319,8 +344,11 @@ struct ExportView: View {
     @AppStorage("exportScope") private var scope = Scope.edited
     @AppStorage("exportFormat") private var format = Format.jpeg
     @AppStorage("exportAddsFilmName") private var addsFilmName = true
+    /// The folder last exported to, kept between launches as a security-scoped bookmark.
+    @AppStorage("exportFolder") private var folderBookmark: Data?
     @State private var folder: URL?
     @State private var result: String?
+    @State private var exportedFolder: URL?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -335,6 +363,14 @@ struct ExportView: View {
         }
         .navigationTitle(library.projectName)
         .navigationSubtitle("Export")
+        .onAppear {
+            guard folder == nil, let folderBookmark else { return }
+            var isStale = false
+            if let url = try? URL(resolvingBookmarkData: folderBookmark, options: .withSecurityScope, bookmarkDataIsStale: &isStale),
+               url.startAccessingSecurityScopedResource() {
+                folder = url
+            }
+        }
     }
 
     private var jobs: [LibraryItem] {
@@ -383,6 +419,9 @@ struct ExportView: View {
                 }
                 if let result {
                     Text(result).foregroundStyle(.secondary)
+                    if let exportedFolder {
+                        Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([exportedFolder]) }
+                    }
                 }
             } footer: {
                 Text("Each photo renders at full resolution with its own settings. Photos you haven't edited use the film's default settings.")
@@ -404,12 +443,15 @@ struct ExportView: View {
         .overlay {
             if jobs.isEmpty {
                 ContentUnavailableView("Nothing to export", systemImage: "photo.on.rectangle",
-                                       description: Text(scope == .selected ? "Select photos in Import." : "Edit a photo first."))
+                                       description: Text(scope == .selected
+                                                         ? "Select photos in Import: ⌘-click to add one, ⇧-click for a run, ⌘A for all."
+                                                         : "Edit a photo first."))
             }
         }
     }
 
-    private func chooseFolder() {
+    /// Asks for the folder to export to, then exports if `exportAfter`.
+    private func chooseFolder(exportAfter: Bool = false) {
         let panel = NSOpenPanel()
         panel.canChooseFiles = false
         panel.canChooseDirectories = true
@@ -417,12 +459,15 @@ struct ExportView: View {
         panel.prompt = "Choose"
         Task {
             let response = if let window = NSApp.keyWindow { await panel.beginSheetModal(for: window) } else { await panel.begin() }
-            if response == .OK { folder = panel.url }
+            guard response == .OK, let url = panel.url else { return }
+            folder = url
+            folderBookmark = try? url.bookmarkData(options: .withSecurityScope, includingResourceValuesForKeys: nil, relativeTo: nil)
+            if exportAfter { export() }
         }
     }
 
     private func export() {
-        guard let folder else { chooseFolder(); return }
+        guard let folder else { chooseFolder(exportAfter: true); return }
         let fallback = photos.startingControls()
         let list: [PhotoModel.ExportJob] = jobs.compactMap { item in
             guard let url = library.url(of: item) else { return nil }
@@ -434,7 +479,10 @@ struct ExportView: View {
         result = nil
         Task {
             let written = await photos.exportPhotos(list, to: folder, as: format.type)
-            result = "Exported \(written) of \(list.count) to \(folder.lastPathComponent)."
+            result = written == list.count
+                ? "Exported \(written) photo\(written == 1 ? "" : "s") to \(folder.lastPathComponent)."
+                : "Exported \(written) of \(list.count) to \(folder.lastPathComponent). The Log says why the rest failed."
+            exportedFolder = written > 0 ? folder : nil
         }
     }
 }
