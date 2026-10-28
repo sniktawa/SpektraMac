@@ -145,7 +145,7 @@ kernel void grain_layer(texture2d<float, access::read> density [[texture(0)]],
     float3 saturation = 1.0f - p * uniformity * (1.0f - 1e-6f);
     float3 grain;
     for (int channel = 0; channel < 3; channel++) {
-        float developed = float(random.poisson(particles[channel] / saturation[channel] * p[channel]));
+        float developed = random.poisson(particles[channel] / saturation[channel] * p[channel]);
         grain[channel] = developed * (density_max[channel] / particles[channel]) * saturation[channel];
     }
     output.write(float4(grain, 1.0f), gid);

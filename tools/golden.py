@@ -28,7 +28,9 @@ Regimes (stochastic effects are always off: no grain, no glare)
   kernel radius capped at half the image).
 
 Pairs: Portra 400 -> Portra Endura, Vision3 500T -> 2383, and scanned directly (scan_film): Velvia 100
-(a slide) and Portra 400 (the negative itself).
+(a slide) and Portra 400 (the negative itself). On the chart only (and the QA oracle when printed),
+every other film on its own target print, the other slides scanned, and Portra 400 on every other
+paper (CHART_PAIRS), so each film and paper is checked end to end.
 
 primitives/ holds per-pixel kernel cases on 64x64x3 float32 inputs, with references computed in
 float64 by the Python functions themselves from those same float32 inputs (so only the kernel's
@@ -164,6 +166,23 @@ PAIRS = [
     # the API but unused.
     ("fujifilm_velvia_100", "kodak_portra_endura", True),
     ("kodak_portra_400", "kodak_portra_endura", True),
+]
+
+# PAIRS and every other film on its own target print, the other slides scanned, and Portra 400 on
+# every other paper: on the chart (cheap, the per-pixel lut_mode regime) and the QA oracle only.
+CHART_PAIRS = PAIRS + [
+    *((film, "fujifilm_crystal_archive_typeii", False)
+      for film in ("fujifilm_c200", "fujifilm_pro_400h", "fujifilm_xtra_400")),
+    *((film, "kodak_portra_endura", False)
+      for film in ("kodak_ektar_100", "kodak_gold_200", "kodak_portra_160", "kodak_portra_800",
+                   "kodak_portra_800_push1", "kodak_portra_800_push2", "kodak_ultramax_400")),
+    *((film, "kodak_2383", False)
+      for film in ("kodak_verita_200d", "kodak_vision3_50d", "kodak_vision3_200t", "kodak_vision3_250d")),
+    *((film, "kodak_portra_endura", True)
+      for film in ("fujifilm_provia_100f", "kodak_ektachrome_100", "kodak_kodachrome_64")),
+    *(("kodak_portra_400", paper, False)
+      for paper in ("fujifilm_crystal_archive_typeii", "kodak_ektacolor_edge", "kodak_endura_premier",
+                    "kodak_supra_endura", "kodak_ultra_endura", "kodak_2393")),
 ]
 
 
@@ -523,8 +542,10 @@ def main():
         "files": {},
     }
 
-    for film, paper, scan_film in PAIRS:
+    for film, paper, scan_film in CHART_PAIRS:
         for input_name, image in inputs.items():
+            if input_name != "chart" and (film, paper, scan_film) not in PAIRS:
+                continue
             if input_name in ("preview", "diffusion") and (film, paper, scan_film) != PAIRS[0]:
                 continue
             case = f"{input_name}-{film}-{'scan' if scan_film else paper}"
@@ -582,7 +603,7 @@ def main():
     # The LUT creator's QA oracle for each printed pair: its 50k random sRGB samples through the
     # pipeline in lut_mode, linear in and out (qa.reference._compute with the default bundle spec:
     # the samples carry its input gain, white 4 stops over grey; the SDR output's gain is 1).
-    for film, paper, scan_film in PAIRS:
+    for film, paper, scan_film in CHART_PAIRS:
         if scan_film:
             continue
         spec = BundleSpec(film_profile=film, print_profiles=(paper,), input_color_space="sRGB",

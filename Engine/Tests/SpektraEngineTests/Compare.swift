@@ -3,7 +3,7 @@ import Testing
 @testable import SpektraEngine
 
 /// `golden/` at the repository root, written by `tools/golden.py` and not in the repository (about
-/// 230 MB): without it, the parity tests don't run. `SPEKTRA_GOLDEN` names another folder, such as
+/// 550 MB): without it, the parity tests don't run. `SPEKTRA_GOLDEN` names another folder, such as
 /// the reference data `tools/check-upstream.sh` makes from another Spektrafilm commit.
 let goldenDirectory = ProcessInfo.processInfo.environment["SPEKTRA_GOLDEN"].map { URL(filePath: $0) }
     ?? URL(filePath: #filePath)
@@ -25,13 +25,32 @@ func golden(_ caseName: String, _ tap: String) throws -> NPYArray {
     try NPYArray(contentsOf: goldenFile(caseName, "\(tap).npy"))
 }
 
-/// The golden cases `tools/golden.py` writes: every film pair on the chart and on the photo, and
-/// the photo in preview mode and with the camera's and the enlarger's diffusion filters on.
+/// The golden cases `tools/golden.py` writes: four pairs on the chart and on the photo, the photo in
+/// preview mode and with the camera's and the enlarger's diffusion filters on, and the rest of
+/// the films and papers on the chart.
 let goldenCases = ["chart", "photo"].flatMap { input in
     ["kodak_portra_400-kodak_portra_endura", "kodak_vision3_500t-kodak_2383", "fujifilm_velvia_100-scan",
      "kodak_portra_400-scan"]
         .map { "\(input)-\($0)" }
 } + ["preview-kodak_portra_400-kodak_portra_endura", "diffusion-kodak_portra_400-kodak_portra_endura"]
+    + chartOnlyPairs.map { "chart-\($0)" }
+
+/// golden.py's CHART_PAIRS past the four above, on the chart and the QA oracle only: every other
+/// film on its own paper, the other slides scanned, and Portra 400 on every other paper. With them,
+/// every film and every paper is checked end to end.
+let chartOnlyPairs = [
+    "fujifilm_c200-fujifilm_crystal_archive_typeii", "fujifilm_pro_400h-fujifilm_crystal_archive_typeii",
+    "fujifilm_xtra_400-fujifilm_crystal_archive_typeii",
+    "kodak_ektar_100-kodak_portra_endura", "kodak_gold_200-kodak_portra_endura", "kodak_portra_160-kodak_portra_endura",
+    "kodak_portra_800-kodak_portra_endura", "kodak_portra_800_push1-kodak_portra_endura",
+    "kodak_portra_800_push2-kodak_portra_endura", "kodak_ultramax_400-kodak_portra_endura",
+    "kodak_verita_200d-kodak_2383", "kodak_vision3_50d-kodak_2383", "kodak_vision3_200t-kodak_2383",
+    "kodak_vision3_250d-kodak_2383",
+    "fujifilm_provia_100f-scan", "kodak_ektachrome_100-scan", "kodak_kodachrome_64-scan",
+    "kodak_portra_400-fujifilm_crystal_archive_typeii", "kodak_portra_400-kodak_ektacolor_edge",
+    "kodak_portra_400-kodak_endura_premier", "kodak_portra_400-kodak_supra_endura",
+    "kodak_portra_400-kodak_ultra_endura", "kodak_portra_400-kodak_2393",
+]
 
 /// Whether a case runs the photo's spatial effects (halation and the inhibitor diffusion, through
 /// Apple's blur): the photo, and the photo with the diffusion filters.

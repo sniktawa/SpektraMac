@@ -828,3 +828,131 @@ extension PhotoOpeningTests {
         }
     }
 }
+
+/// Renders of any stock, any control at either end and any photo that opens have no NaN or
+/// infinite pixels, and a uniform grey renders the same tone at any size (#275). Small photos, so
+/// these add seconds.
+extension PhotoOpeningTests {
+    /// A uniform photo of `value`.
+    static func uniform(_ value: Float, width: Int, height: Int) -> CIImage {
+        RGBImage(width: width, height: height, pixels: [Float](repeating: value, count: width * height * 3)).ciImage
+    }
+
+    /// A 96 × 64 ramp from black to 4× white, left to right.
+    static func ramp() -> CIImage {
+        let (width, height) = (96, 64)
+        let row = (0..<width).flatMap { [Float](repeating: 4 * Float($0) / Float(width - 1), count: 3) }
+        return RGBImage(width: width, height: height, pixels: Array(repeatElement(row, count: height).joined())).ciImage
+    }
+
+    /// Every film on its paper (slides scanned), and Portra 400 on every paper.
+    @Test func everyStockRendersFinite() async throws {
+        let engine = try Engine()
+        _ = try await engine.open(Self.ramp())
+        let films = engine.films.map { film in
+            var controls = Controls()
+            controls.film = film.stock
+            controls.paper = film.targetPrint ?? controls.paper
+            controls.scanFilm = film.type == .positive
+            return controls
+        }
+        let papers = engine.papers.map { paper in
+            var controls = Controls()
+            controls.paper = paper.stock
+            return controls
+        }
+        #expect(films.count == 20 && papers.count == 8)
+        for controls in films + papers {
+            let pixels = try await engine.render(controls: controls, mode: .full).pixels
+            #expect(pixels.allSatisfy { $0.isFinite }, "\(controls.film) on \(controls.scanFilm ? "the scanner" : controls.paper)")
+        }
+    }
+
+    /// Each control in ``Controls/ranges`` at each end, then every one at its lower end at once and
+    /// at its upper end, with both diffusion filters and the burn on: finite, and not black.
+    @Test func controlsAtTheirEndsRender() async throws {
+        let engine = try Engine()
+        _ = try await engine.open(Self.ramp())
+        var base = Controls()
+        base.cameraDiffusion.active = true
+        base.enlargerDiffusion.active = true
+        base.burn = true
+        var settings: [(name: String, controls: Controls, black: Bool)] = []
+        for (control, range) in Controls.ranges {
+            for end in [range.lowerBound, range.upperBound] {
+                var controls = base
+                controls[keyPath: control] = end
+                // 12 stops under, the ramp's brightest pixel gives the film 4 × 2⁻¹² of white's
+                // exposure: the print of a negative that thin is rightly black.
+                settings.append(("\(control) at \(end)", controls, control == \Controls.exposureOffsetEV && end < 0))
+            }
+        }
+        for (name, end) in [("lower", \ClosedRange<Double>.lowerBound), ("upper", \ClosedRange<Double>.upperBound)] {
+            var controls = base
+            for (control, range) in Controls.ranges {
+                controls[keyPath: control] = range[keyPath: end]
+            }
+            settings.append(("every control at its \(name) end", controls, false))
+        }
+        for (name, controls, black) in settings {
+            let pixels = try await engine.render(controls: controls, mode: .full).pixels
+            #expect(pixels.allSatisfy { $0.isFinite }, "\(name)")
+            #expect(black || pixels.contains { $0 > 0.01 }, "\(name) renders black")
+        }
+    }
+
+    /// Photos at the edge of what opens: 1 × 1, 1 × 40 and 40 × 1, black, white, very bright,
+    /// negative, nearly 0, and one with a NaN and an infinite pixel; with the default settings and
+    /// with both diffusion filters on.
+    @Test func awkwardPhotosRenderFinite() async throws {
+        var broken = [Float](repeating: 0.18, count: 8 * 8 * 3)
+        broken[0] = .nan
+        broken[100] = .infinity
+        let photos = [
+            ("1 × 1", Self.uniform(0.18, width: 1, height: 1)),
+            ("1 × 40", Self.uniform(0.18, width: 1, height: 40)),
+            ("40 × 1", Self.uniform(0.18, width: 40, height: 1)),
+            ("black", Self.uniform(0, width: 8, height: 8)),
+            ("white", Self.uniform(1, width: 8, height: 8)),
+            ("1000× white", Self.uniform(1000, width: 8, height: 8)),
+            ("negative", Self.uniform(-0.5, width: 8, height: 8)),
+            ("1e-12", Self.uniform(1e-12, width: 8, height: 8)),
+            ("a NaN and an infinite pixel", RGBImage(width: 8, height: 8, pixels: broken).ciImage),
+        ]
+        var diffused = Controls()
+        diffused.cameraDiffusion.active = true
+        diffused.enlargerDiffusion.active = true
+        let engine = try Engine()
+        for (name, photo) in photos {
+            _ = try await engine.open(photo)
+            for controls in [Controls(), diffused] {
+                let pixels = try await engine.render(controls: controls, mode: .full).pixels
+                #expect(pixels.allSatisfy { $0.isFinite }, "\(name), diffusion \(controls.cameraDiffusion.active ? "on" : "off")")
+            }
+        }
+    }
+
+    /// A uniform 0.18 grey's render has the same mean at every size, within 1 % of 300 × 200's, as
+    /// in Python, where it's flat too. A 1 × 1 photo's single pixel is the whole frame, so its grain
+    /// is one random draw, but of about 10⁹ particles: with the fixed seed it lands 0.2 % under
+    /// 300 × 200's, about where it does with grain off (0.1 %), well inside the same 1 %.
+    @Test(arguments: ["defaults", "grain off", "lens diffusion", "enlarger diffusion"])
+    func greyKeepsItsToneAtEverySize(setting: String) async throws {
+        var controls = Controls()
+        controls.grain = setting != "grain off"
+        controls.cameraDiffusion.active = setting == "lens diffusion"
+        controls.enlargerDiffusion.active = setting == "enlarger diffusion"
+        let engine = try Engine()
+        var means: [(size: String, mean: Double)] = []
+        for (width, height) in [(1, 1), (2, 2), (8, 8), (64, 48), (300, 1), (1, 300), (300, 200)] {
+            _ = try await engine.open(Self.uniform(0.18, width: width, height: height))
+            let pixels = try await engine.render(controls: controls, mode: .full).pixels
+            means.append(("\(width) × \(height)", pixels.reduce(0) { $0 + Double($1) } / Double(pixels.count)))
+        }
+        let reference = means.last!.mean
+        print("grey by size, \(setting): " + means.map { "\($0.size) \(String(format: "%.4f", $0.mean))" }.joined(separator: ", "))
+        for (size, mean) in means {
+            #expect(abs(mean / reference - 1) < 0.01, "\(setting), \(size): \(mean) against \(reference)")
+        }
+    }
+}

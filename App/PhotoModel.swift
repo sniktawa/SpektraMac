@@ -100,7 +100,7 @@ final class PhotoModel {
     }
     /// What choosing `film` sets the controls to (``film``).
     func controls(choosing film: String) -> Controls {
-        var chosen = savedDefaults(for: film) ?? factoryControls(for: film, from: controls)
+        var chosen = savedDefaults(for: film) ?? controls.choosing(film: film, from: films)
         chosen.framing = controls.framing
         return chosen
     }
@@ -109,32 +109,18 @@ final class PhotoModel {
     var paperName: String { papers.first { $0.stock == controls.paper }?.name ?? controls.paper }
     var films: [ProfileInfo] { engine?.films ?? [] }
     var papers: [ProfileInfo] { engine?.papers ?? [] }
-    /// The exposure the slider shows, in stops over the photo as shot: the controls' mark's
-    /// reading for this photo plus their offset. Set within ``snap`` of a mark, it lands on the
-    /// mark; elsewhere it keeps the nearest mark and the offset from it, so the next photo opens
-    /// as far from that mark's own reading.
+    /// The exposure the slider shows, in stops over the photo as shot (``Controls/exposureEV(readings:)``).
+    /// Set near a mark, it lands on the mark (``Controls/settingExposure(_:readings:)``).
     var exposureEV: Double {
-        get {
-            guard let photo else { return controls.exposureOffsetEV }
-            return photo.metering.reading(resolving: controls.exposureMark).ev + controls.exposureOffsetEV
-        }
+        get { photo.map { controls.exposureEV(readings: $0.metering) } ?? controls.exposureOffsetEV }
         set {
             guard let photo else { return }
-            let nearest = MeteringMark.allCases.compactMap { mark in photo.metering.ev[mark.rawValue].map { (mark, $0) } }
-                .min { abs($0.1 - newValue) < abs($1.1 - newValue) }!
-            var controls = controls
-            controls.exposureMark = nearest.0
-            controls.exposureOffsetEV = abs(newValue - nearest.1) < Self.snap ? 0 : newValue - nearest.1
-            self.controls = controls
+            controls = controls.settingExposure(newValue, readings: photo.metering)
         }
     }
-    /// How close to a mark the slider lands on it, in stops.
-    static let snap = 0.15
-    /// The exposure's range: −4…+8 stops, widened to whole stops past any reading outside it. Not
-    /// past the exposure: a drag held at the end would widen it, and the next step follow it.
+    /// The exposure's range (``Controls/exposureRange(readings:)``).
     var exposureRange: ClosedRange<Double> {
-        let readings = photo?.metering.ev.compactMap { $0 } ?? []
-        return min(-4, (readings.min() ?? 0).rounded(.down) - 1)...max(8, (readings.max() ?? 0).rounded(.up) + 1)
+        Controls.exposureRange(readings: photo?.metering)
     }
     /// The marks the exposure is on: those whose reading for this photo rounds to it.
     var marksAtExposure: [MeteringMark] {
@@ -635,23 +621,20 @@ final class PhotoModel {
 
     // MARK: Thumbnail strips
 
-    /// A control shown as Photos shows its main adjustments: the photo across the control's range,
-    /// a frame each, rendered in preview mode on a small image of the photo (``RenderMode/thumbnail``).
-    /// Halation, grain and glare barely show at that size, so they have none.
-    enum Strip: CaseIterable {
-        case exposure, couplerSaturation, printExposure
-    }
+    /// Each strip (``Controls/Strip``) has this many frames, rendered in preview mode on a small
+    /// image of the photo (``RenderMode/thumbnail``). Halation, grain and glare barely show at that
+    /// size, so they have none.
     static let framesPerStrip = 5
     /// Each strip's frames, left to right. A strip whose control changes nothing the controls show
     /// (a print setting while the film shows, say) has none.
-    private(set) var strips: [Strip: [CGImage]] = [:]
+    private(set) var strips: [Controls.Strip: [CGImage]] = [:]
     /// The controls the strips were made for.
     @ObservationIgnored private var stripControls: Controls?
     /// Makes the strips for the controls; a change to them stops it (``render(from:)``).
     @ObservationIgnored private var stripTask: Task<Void, Never>?
 
     /// The range a strip's control spans.
-    func range(of strip: Strip) -> ClosedRange<Double> {
+    func range(of strip: Controls.Strip) -> ClosedRange<Double> {
         switch strip {
         case .exposure: exposureRange
         case .couplerSaturation: Controls.range(\.couplerSaturation)
@@ -669,8 +652,8 @@ final class PhotoModel {
             let start = ContinuousClock.now
             var count = 0
             do {
-                for strip in Strip.allCases {
-                    guard applies(strip, to: controls) else {
+                for strip in Controls.Strip.allCases {
+                    guard strip.applies(to: controls) else {
                         strips[strip] = nil
                         continue
                     }
@@ -681,7 +664,7 @@ final class PhotoModel {
                         let value = span.lowerBound
                             + (Double(frame) + 0.5) / Double(Self.framesPerStrip) * (span.upperBound - span.lowerBound)
                         frames.append(try await engine.display(
-                            controls: frameControls(controls, strip: strip, value: value, photo: photo), mode: .thumbnail))
+                            controls: controls.setting(strip, to: value, readings: photo.metering), mode: .thumbnail))
                         try Task.checkCancellation()
                     }
                     strips[strip] = frames
@@ -697,30 +680,6 @@ final class PhotoModel {
                 fail("Could not render the thumbnails", error)
             }
         }
-    }
-
-    /// Whether `strip`'s control changes what `controls` show.
-    private func applies(_ strip: Strip, to controls: Controls) -> Bool {
-        switch strip {
-        case .exposure: true
-        case .couplerSaturation: controls.couplers
-        case .printExposure: !controls.scanFilm
-        }
-    }
-
-    /// `controls` with `strip`'s control at `value`: for the exposure, `value` stops over the
-    /// photo as shot, from the controls' mark.
-    private func frameControls(_ controls: Controls, strip: Strip, value: Double, photo: Photo) -> Controls {
-        var controls = controls
-        switch strip {
-        case .exposure:
-            controls.exposureOffsetEV = value - photo.metering.reading(resolving: controls.exposureMark).ev
-        case .couplerSaturation:
-            controls.couplerSaturation = value
-        case .printExposure:
-            controls.printExposure = value
-        }
-        return controls
     }
 
     // MARK: Choices rendered ahead
@@ -1093,7 +1052,7 @@ final class PhotoModel {
     func restoreFactoryDefaults() {
         setSavedDefaults(nil, for: controls.film)
         actionName = "Restore Factory Defaults"
-        var factory = factoryControls(for: controls.film, from: Controls())
+        var factory = Controls().choosing(film: controls.film, from: films)
         factory.framing = controls.framing
         controls = factory
         actionName = nil
@@ -1136,36 +1095,15 @@ final class PhotoModel {
         }
     }
 
-    /// `controls` read from a preset (or a film's saved defaults), which can be edited by hand, made
-    /// what the app can render: every number within its range, and a slide viewed directly, as the
-    /// Print | Film switch has it. Says in the log what it changed, if `source` names the preset.
+    /// `controls` read from a preset (or a film's saved defaults) made what the app can render
+    /// (``Controls/checked(films:)``). Says in the log what it changed, if `source` names the preset.
     private func checked(_ controls: Controls, from source: String? = nil) -> Controls {
-        var checked = controls.clampedToRanges()
+        var (checked, changed) = controls.checked(films: films)
         checked.framing = checked.framing.checked
-        if films.first(where: { $0.stock == controls.film })?.type == .positive {
-            checked.scanFilm = true
-        }
-        if let source {
-            let changed = zip(Mirror(reflecting: controls).children, Mirror(reflecting: checked).children)
-                .filter { "\($0.value)" != "\($1.value)" }
-                .compactMap(\.0.label)
-            if !changed.isEmpty {
-                note("Changed \(changed.formatted(.list(type: .and))) from \(source) to what SpektraMac can render")
-            }
+        if let source, !changed.isEmpty {
+            note("Changed \(changed.formatted(.list(type: .and))) from \(source) to what SpektraMac can render")
         }
         return checked
-    }
-
-    /// `controls` with `film`, its target paper (if it has one) and slides viewed directly.
-    private func factoryControls(for film: String, from controls: Controls) -> Controls {
-        var controls = controls
-        controls.film = film
-        guard let info = films.first(where: { $0.stock == film }) else { return controls }
-        if let paper = info.targetPrint {
-            controls.paper = paper
-        }
-        controls.scanFilm = info.type == .positive
-        return controls
     }
 
     // MARK: Undo
@@ -1199,41 +1137,13 @@ final class PhotoModel {
     /// in unless ``actionName`` names it. Undoing sets the controls, which registers Redo, as named.
     private func registerUndo(from previous: Controls) {
         guard let undoManager else { return }
-        let name = actionName ?? Self.groupName(changedFrom: previous, to: controls)
+        let name = actionName ?? Controls.groupName(changedFrom: previous, to: controls)
         undoManager.registerUndo(withTarget: self) { model in
             model.actionName = name
             model.controls = previous
             model.actionName = nil
         }
         undoManager.setActionName(name)
-    }
-
-    /// The settings group a change is in, as the panel names it, by the first control it changed.
-    private static func groupName(changedFrom old: Controls, to new: Controls) -> String {
-        let changed = zip(Mirror(reflecting: old).children, Mirror(reflecting: new).children)
-            .first { "\($0.value)" != "\($1.value)" }?.0.label ?? ""
-        return switch changed {
-        case "film": "Film"
-        case "paper": "Paper"
-        case "scanFilm": "Print or Film"
-        case "exposureMark", "exposureOffsetEV", "highlightBoost": "Exposure"
-        case "printExposure", "yFilterShift", "mFilterShift": "Enlarger"
-        case let name where name.hasPrefix("preflash"): "Enlarger"
-        case let name where name.hasPrefix("vignette"): "Vignette"
-        case let name where name.hasPrefix("scan") && name != "scanFilm": "Scanned Print"
-        case "printContrast", "printHighlightContrast", "printShadowContrast": "Contrast"
-        case "cameraDiffusion": "Lens Diffusion"
-        case "enlargerDiffusion": "Enlarger Diffusion"
-        case let name where name.hasPrefix("burn"): "Burn"
-        case let name where name.hasPrefix("glare"): "Glare"
-        case let name where name.hasPrefix("halation") || name.hasPrefix("scatter"): "Halation"
-        case let name where name.hasPrefix("coupler"): "Couplers"
-        case let name where name.hasPrefix("grain"): "Grain"
-        case "rotation": "Rotate"
-        case "straighten": "Straighten"
-        case let name where name.hasPrefix("crop"): "Crop"
-        default: "Settings"
-        }
     }
 
     // MARK: Framing
@@ -1322,99 +1232,31 @@ final class PhotoModel {
 
     // MARK: Adjustments
 
-    /// The settings' groups, as Photos groups its adjustments: each resets on its own.
-    enum Adjustment: String, CaseIterable, Codable {
-        case stocks, exposure, cameraDiffusion, halation, couplers, grain, contrast, enlarger, vignette, burn, enlargerDiffusion, glare,
-             scanLook, crop
-    }
+    /// The settings' groups (``Controls/Adjustment``), as Photos groups its adjustments.
+    typealias Adjustment = Controls.Adjustment
 
     /// Whether `adjustment`'s controls are what choosing the film applies.
-    func isAtDefaults(_ adjustment: Adjustment) -> Bool {
-        controls == resetting(adjustment, in: controls)
+    func isAtDefaults(_ adjustment: Controls.Adjustment) -> Bool {
+        controls == controls.resetting(adjustment, to: resetDefaults(for: controls.film))
     }
 
     /// Returns `adjustment`'s controls to what choosing the film applies.
-    func reset(_ adjustment: Adjustment) {
-        controls = resetting(adjustment, in: controls)
+    func reset(_ adjustment: Controls.Adjustment) {
+        controls = controls.resetting(adjustment, to: resetDefaults(for: controls.film))
     }
 
-    /// `controls` with `adjustment`'s from the film's saved defaults, or the app's own. Saved
-    /// defaults that can't be read were reported when the film was chosen, so here they're the
-    /// app's own.
-    private func resetting(_ adjustment: Adjustment, in controls: Controls) -> Controls {
-        let defaults = UserDefaults.standard.data(forKey: Self.defaultsKey(controls.film))
+    /// What a Reset button returns its controls to: the film's saved defaults, or the app's own.
+    /// Saved defaults that can't be read were reported when the film was chosen, so here they're
+    /// the app's own.
+    private func resetDefaults(for film: String) -> Controls {
+        UserDefaults.standard.data(forKey: Self.defaultsKey(film))
             .flatMap { try? Controls(preset: $0) }.map { checked($0) } ?? Controls()
-        return Self.copying([adjustment], from: defaults, into: controls)
     }
 
-    /// `target` with `groups`' controls from `source`: for a reset, pasting edits or a preset that
-    /// keeps only some groups.
+    /// `target` with `groups`' controls from `source`: pasting edits or a preset that keeps only
+    /// some groups.
     static func copying(_ groups: Set<Adjustment>, from source: Controls, into target: Controls) -> Controls {
-        var copy = target
-        for group in groups {
-            switch group {
-            case .stocks:
-                copy.film = source.film
-                copy.paper = source.paper
-                copy.scanFilm = source.scanFilm
-            case .exposure:
-                copy.exposureMark = source.exposureMark
-                copy.exposureOffsetEV = source.exposureOffsetEV
-                copy.highlightBoost = source.highlightBoost
-            case .cameraDiffusion:
-                copy.cameraDiffusion = source.cameraDiffusion
-            case .halation:
-                copy.halation = source.halation
-                copy.halationAmount = source.halationAmount
-                copy.halationSize = source.halationSize
-                copy.scatterAmount = source.scatterAmount
-                copy.scatterSize = source.scatterSize
-            case .couplers:
-                copy.couplers = source.couplers
-                copy.couplerSaturation = source.couplerSaturation
-                copy.couplerEdgeContrast = source.couplerEdgeContrast
-            case .grain:
-                copy.grain = source.grain
-                copy.grainSize = source.grainSize
-                copy.grainSoftness = source.grainSoftness
-            case .contrast:
-                copy.printContrast = source.printContrast
-                copy.printHighlightContrast = source.printHighlightContrast
-                copy.printShadowContrast = source.printShadowContrast
-            case .enlarger:
-                copy.printExposure = source.printExposure
-                copy.yFilterShift = source.yFilterShift
-                copy.mFilterShift = source.mFilterShift
-                copy.preflash = source.preflash
-                copy.preflashYFilterShift = source.preflashYFilterShift
-                copy.preflashMFilterShift = source.preflashMFilterShift
-            case .vignette:
-                copy.vignette = source.vignette
-                copy.vignetteStops = source.vignetteStops
-                copy.vignetteMidpoint = source.vignetteMidpoint
-                copy.vignetteSoftness = source.vignetteSoftness
-            case .burn:
-                copy.burn = source.burn
-                copy.burnStops = source.burnStops
-                copy.burnThreshold = source.burnThreshold
-            case .enlargerDiffusion:
-                copy.enlargerDiffusion = source.enlargerDiffusion
-            case .glare:
-                copy.glare = source.glare
-                copy.glareAmount = source.glareAmount
-                copy.glareRoughness = source.glareRoughness
-                copy.glareSoftness = source.glareSoftness
-            case .scanLook:
-                copy.scanLook = source.scanLook
-                copy.scanBlackLevel = source.scanBlackLevel
-                copy.scanShadowHue = source.scanShadowHue
-                copy.scanShadowAmount = source.scanShadowAmount
-                copy.scanShadowRange = source.scanShadowRange
-            case .crop:
-                copy.framing = source.framing
-            }
-        }
-        return copy
+        groups.reduce(target) { $0.resetting($1, to: source) }
     }
 
     /// Sets the controls to `new` (checked as a preset is), as one undo step named `name`.

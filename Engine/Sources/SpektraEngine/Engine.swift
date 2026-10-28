@@ -205,6 +205,208 @@ public struct Controls: Codable, Sendable, Hashable {
     }
 }
 
+/// The app's rules for the settings: what each Reset button resets, what Undo is called, what
+/// choosing a film sets, how a preset is made renderable, where the Exposure slider lands, and the
+/// strips' frames. Here rather than in the app, so they're tested; the app keeps the state and
+/// what it reads them from (the films, the saved defaults, the open photo's readings).
+extension Controls {
+    /// The settings' groups, as Photos groups its adjustments: each resets on its own.
+    /// Also what copying edits and presets keep, by their raw values: `stocks` (the film, paper
+    /// and Print | Film) and `crop` (the framing) have no Reset button of their own.
+    public enum Adjustment: String, CaseIterable, Codable, Sendable {
+        case stocks, exposure, cameraDiffusion, halation, couplers, grain, contrast, enlarger, vignette, burn, enlargerDiffusion,
+             glare, scanLook, crop
+    }
+
+    /// These controls with `adjustment`'s from `defaults`: the film's saved defaults, or the app's own.
+    public func resetting(_ adjustment: Adjustment, to defaults: Controls) -> Controls {
+        var reset = self
+        switch adjustment {
+        case .stocks:
+            reset.film = defaults.film
+            reset.paper = defaults.paper
+            reset.scanFilm = defaults.scanFilm
+        case .exposure:
+            reset.exposureMark = defaults.exposureMark
+            reset.exposureOffsetEV = defaults.exposureOffsetEV
+            reset.highlightBoost = defaults.highlightBoost
+        case .cameraDiffusion:
+            reset.cameraDiffusion = defaults.cameraDiffusion
+        case .halation:
+            reset.halation = defaults.halation
+            reset.halationAmount = defaults.halationAmount
+            reset.halationSize = defaults.halationSize
+            reset.scatterAmount = defaults.scatterAmount
+            reset.scatterSize = defaults.scatterSize
+        case .couplers:
+            reset.couplers = defaults.couplers
+            reset.couplerSaturation = defaults.couplerSaturation
+            reset.couplerEdgeContrast = defaults.couplerEdgeContrast
+        case .grain:
+            reset.grain = defaults.grain
+            reset.grainSize = defaults.grainSize
+            reset.grainSoftness = defaults.grainSoftness
+        case .contrast:
+            reset.printContrast = defaults.printContrast
+            reset.printHighlightContrast = defaults.printHighlightContrast
+            reset.printShadowContrast = defaults.printShadowContrast
+        case .enlarger:
+            reset.printExposure = defaults.printExposure
+            reset.yFilterShift = defaults.yFilterShift
+            reset.mFilterShift = defaults.mFilterShift
+            reset.preflash = defaults.preflash
+            reset.preflashYFilterShift = defaults.preflashYFilterShift
+            reset.preflashMFilterShift = defaults.preflashMFilterShift
+        case .vignette:
+            reset.vignette = defaults.vignette
+            reset.vignetteStops = defaults.vignetteStops
+            reset.vignetteMidpoint = defaults.vignetteMidpoint
+            reset.vignetteSoftness = defaults.vignetteSoftness
+        case .burn:
+            reset.burn = defaults.burn
+            reset.burnStops = defaults.burnStops
+            reset.burnThreshold = defaults.burnThreshold
+        case .enlargerDiffusion:
+            reset.enlargerDiffusion = defaults.enlargerDiffusion
+        case .glare:
+            reset.glare = defaults.glare
+            reset.glareAmount = defaults.glareAmount
+            reset.glareRoughness = defaults.glareRoughness
+            reset.glareSoftness = defaults.glareSoftness
+        case .scanLook:
+            reset.scanLook = defaults.scanLook
+            reset.scanBlackLevel = defaults.scanBlackLevel
+            reset.scanShadowHue = defaults.scanShadowHue
+            reset.scanShadowAmount = defaults.scanShadowAmount
+            reset.scanShadowRange = defaults.scanShadowRange
+        case .crop:
+            reset.rotation = defaults.rotation
+            reset.straighten = defaults.straighten
+            reset.cropX = defaults.cropX
+            reset.cropY = defaults.cropY
+            reset.cropWidth = defaults.cropWidth
+            reset.cropHeight = defaults.cropHeight
+        }
+        return reset
+    }
+
+    /// The settings group a change is in, as the panel names it, by the first control it changed:
+    /// the change's Undo name.
+    public static func groupName(changedFrom old: Controls, to new: Controls) -> String {
+        let changed = zip(Mirror(reflecting: old).children, Mirror(reflecting: new).children)
+            .first { "\($0.value)" != "\($1.value)" }?.0.label ?? ""
+        return switch changed {
+        case "film": "Film"
+        case "paper": "Paper"
+        case "scanFilm": "Print or Film"
+        case "exposureMark", "exposureOffsetEV", "highlightBoost": "Exposure"
+        case "printExposure", "yFilterShift", "mFilterShift": "Enlarger"
+        case let name where name.hasPrefix("preflash"): "Enlarger"
+        case let name where name.hasPrefix("vignette"): "Vignette"
+        case let name where name.hasPrefix("scan") && name != "scanFilm": "Scanned Print"
+        case "printContrast", "printHighlightContrast", "printShadowContrast": "Contrast"
+        case "cameraDiffusion": "Lens Diffusion"
+        case "enlargerDiffusion": "Enlarger Diffusion"
+        case let name where name.hasPrefix("burn"): "Burn"
+        case let name where name.hasPrefix("glare"): "Glare"
+        case let name where name.hasPrefix("halation") || name.hasPrefix("scatter"): "Halation"
+        case let name where name.hasPrefix("coupler"): "Couplers"
+        case let name where name.hasPrefix("grain"): "Grain"
+        case "rotation": "Rotate"
+        case "straighten": "Straighten"
+        case let name where name.hasPrefix("crop"): "Crop"
+        default: "Settings"
+        }
+    }
+
+    /// These controls with `film`, its target paper (if it has one) and slides viewed directly,
+    /// as Spektrafilm's GUI does: what choosing a film without saved defaults sets. `films` are
+    /// the films to choose from (``Engine/films``).
+    public func choosing(film: String, from films: [ProfileInfo]) -> Controls {
+        var controls = self
+        controls.film = film
+        guard let info = films.first(where: { $0.stock == film }) else { return controls }
+        if let paper = info.targetPrint {
+            controls.paper = paper
+        }
+        controls.scanFilm = info.type == .positive
+        return controls
+    }
+
+    /// These controls read from a preset (or a film's saved defaults), which can be edited by hand,
+    /// made what the engine can render: every number within its range, and a slide viewed
+    /// directly, as the Print | Film switch has it. With the names of the controls that changed.
+    public func checked(films: [ProfileInfo]) -> (controls: Controls, changed: [String]) {
+        var checked = clampedToRanges()
+        if films.first(where: { $0.stock == film })?.type == .positive {
+            checked.scanFilm = true
+        }
+        let changed = zip(Mirror(reflecting: self).children, Mirror(reflecting: checked).children)
+            .filter { "\($0.value)" != "\($1.value)" }
+            .compactMap(\.0.label)
+        return (checked, changed)
+    }
+
+    /// How close to a mark, in stops, the exposure lands on it (``settingExposure(_:readings:)``).
+    public static let exposureSnap = 0.15
+
+    /// The exposure these controls give a photo metered as `readings`, in stops over it as shot:
+    /// their mark's reading plus their offset.
+    public func exposureEV(readings: MeteringReadings) -> Double {
+        readings.reading(resolving: exposureMark).ev + exposureOffsetEV
+    }
+
+    /// These controls with the exposure at `ev` stops over a photo metered as `readings`, as shot.
+    /// Within ``exposureSnap`` of a mark, it lands on the mark; elsewhere it keeps the nearest mark
+    /// and the offset from it, so the next photo opens as far from that mark's own reading.
+    public func settingExposure(_ ev: Double, readings: MeteringReadings) -> Controls {
+        let nearest = MeteringMark.allCases.compactMap { mark in readings.ev[mark.rawValue].map { (mark, $0) } }
+            .min { abs($0.1 - ev) < abs($1.1 - ev) }!
+        var controls = self
+        controls.exposureMark = nearest.0
+        controls.exposureOffsetEV = abs(ev - nearest.1) < Self.exposureSnap ? 0 : ev - nearest.1
+        return controls
+    }
+
+    /// The Exposure slider's range for a photo metered as `readings` (nil with none open): −4…+8
+    /// stops, widened to whole stops past any reading outside it. Not past the exposure: a drag
+    /// held at the end would widen it, and the next step follow it.
+    public static func exposureRange(readings: MeteringReadings?) -> ClosedRange<Double> {
+        let evs = readings?.ev.compactMap { $0 } ?? []
+        return min(-4, (evs.min() ?? 0).rounded(.down) - 1)...max(8, (evs.max() ?? 0).rounded(.up) + 1)
+    }
+
+    /// A control shown as Photos shows its main adjustments: the photo across the control's range,
+    /// a frame each (the app's thumbnail strips).
+    public enum Strip: CaseIterable, Sendable {
+        case exposure, couplerSaturation, printExposure
+
+        /// Whether this strip's control changes what `controls` show.
+        public func applies(to controls: Controls) -> Bool {
+            switch self {
+            case .exposure: true
+            case .couplerSaturation: controls.couplers
+            case .printExposure: !controls.scanFilm
+            }
+        }
+    }
+
+    /// These controls with `strip`'s control at `value`: for the exposure, `value` stops over the
+    /// photo as shot (metered as `readings`), from the controls' mark.
+    public func setting(_ strip: Strip, to value: Double, readings: MeteringReadings) -> Controls {
+        var controls = self
+        switch strip {
+        case .exposure:
+            controls.exposureOffsetEV = value - readings.reading(resolving: exposureMark).ev
+        case .couplerSaturation:
+            controls.couplerSaturation = value
+        case .printExposure:
+            controls.printExposure = value
+        }
+        return controls
+    }
+}
+
 /// A 3D colour lookup table: `size`³ RGB outputs for inputs evenly spaced over [0, 1], red
 /// changing fastest, then green, then blue.
 public struct LUT: Sendable {
@@ -394,7 +596,7 @@ public actor Engine {
 
         /// The exposure `controls` give this image: their mark's reading for it plus their offset.
         func exposureEV(for controls: Controls) -> Double {
-            metering.reading(resolving: controls.exposureMark).ev + controls.exposureOffsetEV
+            controls.exposureEV(readings: metering)
         }
     }
 

@@ -47,16 +47,17 @@ struct Random {
     float lognormal(float mu, float sigma) { return sigma < 1e-6f ? exp(mu) : exp(mu + sigma * normal()); }
 
     // Poisson(λ), as fast_poisson: Knuth's product of uniforms below λ = 30, above it the normal
-    // approximation rounded and floored at 0.
-    uint poisson(float lambda) {
-        if (!(lambda > 0.0f)) return 0;
-        if (lambda >= 30.0f) return uint(fmax(rint(lambda + sqrt(lambda) * normal()), 0.0f));
+    // approximation rounded and floored at 0. A float rather than a uint, as Python's is an int64:
+    // grain on a 1 × 1 photo, a pixel the size of the frame, draws past 2³² particles.
+    float poisson(float lambda) {
+        if (!(lambda > 0.0f)) return 0.0f;
+        if (lambda >= 30.0f) return fmax(rint(lambda + sqrt(lambda) * normal()), 0.0f);
         float limit = exp(-lambda), product = uniform();
         uint count = 0;
         while (product > limit) {
             product *= uniform();
             count++;
         }
-        return count;
+        return float(count);
     }
 };

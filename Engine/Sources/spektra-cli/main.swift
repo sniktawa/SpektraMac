@@ -1,8 +1,21 @@
+import CoreImage
 import Foundation
 import SpektraEngine
 
 let arguments = CommandLine.arguments.dropFirst()
 switch arguments.first {
+case "photo":
+    // spektra-cli photo <width> <height> <file.jpg>: writes a test photo, the synthetic image below,
+    // so tools/benchmark.sh doesn't depend on a photo being there.
+    let numbers = arguments.dropFirst().prefix(2).compactMap { Int($0) }
+    guard numbers.count == 2, let path = arguments.dropFirst(3).first else { usage() }
+    try writeTestPhoto(width: numbers[0], height: numbers[1], to: URL(filePath: path))
+case "save":
+    // spektra-cli save <photo> <file.jpg> [lens | enlarger]: saves the photo as the app does, timed.
+    let paths = Array(arguments.dropFirst())
+    let diffusion = paths.count == 3 ? paths[2] : nil
+    guard paths.count == 2 || ["lens", "enlarger"].contains(diffusion) else { usage() }
+    try await save(URL(filePath: paths[0]), to: URL(filePath: paths[1]), diffusion: diffusion)
 case "benchmark":
     if let path = arguments.dropFirst().first, Int(path) == nil {
         // spektra-cli benchmark <photo>: times the app's renders of a photo (the README's figures).
@@ -16,7 +29,61 @@ case "benchmark":
 default:
     print("spektra-cli — port of Spektrafilm at \(SpektraEngine.referenceCommit.prefix(7))")
     print("GPU: \(try GPU().device.name)")
-    print("Usage: spektra-cli benchmark [width height | photo]")
+    usage()
+}
+
+func usage() -> Never {
+    print("""
+        Usage: spektra-cli benchmark [width height | photo]
+               spektra-cli save <photo> <file.jpg> [lens | enlarger]
+               spektra-cli photo <width> <height> <file.jpg>
+        """)
+    exit(1)
+}
+
+/// Saves the photo at `url` as a JPEG at `destination` the way the app does, in a process of its
+/// own: opens it, renders the preview, then times ``Engine/export(controls:as:)`` and the write, as
+/// the app's Save reports them. The default settings (Portra 400 printed on Portra Endura), with the
+/// default diffusion filter (Black Pro-Mist 1/2) on the `lens` or the `enlarger` if asked.
+/// tools/benchmark.sh reads the process's peak memory footprint.
+func save(_ url: URL, to destination: URL, diffusion: String?) async throws {
+    let engine = try Engine()
+    _ = try await engine.open(RGBImage.decode(contentsOf: url))
+    var controls = Controls()
+    controls.cameraDiffusion.active = diffusion == "lens"
+    controls.enlargerDiffusion.active = diffusion == "enlarger"
+    _ = try await engine.render(controls: controls, mode: .preview)
+    let start = ContinuousClock.now
+    let image = try await engine.export(controls: controls, as: .jpeg)
+    try image.write(to: destination, as: .jpeg, metadata: nil,
+                    record: EditRecord(software: "spektra-cli", summary: "", keywords: [], controls: controls))
+    // Plain milliseconds, for the script to read in any locale.
+    print("save: \(Int(((ContinuousClock.now - start) / .milliseconds(1)).rounded())) ms")
+}
+
+/// A smooth gradient with texture: values span the exposure range like a photo.
+func syntheticPixel(x: Int, y: Int, width: Int, height: Int) -> SIMD3<Float> {
+    SIMD3(Float(x) / Float(width), Float(y) / Float(height), Float((x ^ y) & 255) / 255)
+}
+
+/// The synthetic image as an 8-bit sRGB JPEG at quality 0.98, as the app saves one.
+func writeTestPhoto(width: Int, height: Int, to url: URL) throws {
+    var bytes = [UInt8](repeating: 255, count: width * height * 4)
+    for y in 0..<height {
+        for x in 0..<width {
+            let pixel = (syntheticPixel(x: x, y: y, width: width, height: height) * 255).rounded(.toNearestOrAwayFromZero)
+            let index = (y * width + x) * 4
+            bytes[index] = UInt8(pixel.x)
+            bytes[index + 1] = UInt8(pixel.y)
+            bytes[index + 2] = UInt8(pixel.z)
+        }
+    }
+    let sRGB = CGColorSpace(name: CGColorSpace.sRGB)!
+    let image = CIImage(bitmapData: Data(bytes), bytesPerRow: width * 4, size: CGSize(width: width, height: height),
+                        format: .RGBA8, colorSpace: sRGB)
+    try CIContext().writeJPEGRepresentation(
+        of: image, to: url, colorSpace: sRGB,
+        options: [CIImageRepresentationOption(rawValue: kCGImageDestinationLossyCompressionQuality as String): 0.98])
 }
 
 /// The app's renders of `url` with the default settings (Portra 400 printed on Portra Endura): the
@@ -59,14 +126,14 @@ func benchmark(width: Int, height: Int) throws {
 
     let simulation = try Simulation(parameters: parameters, film: film, print: paper, gpu: gpu, tables: Tables.load())
     lap("setup (tc LUT, print constants, C_max)")
-    // A smooth gradient with texture: values span the exposure range like a photo.
     var pixels = [Float](repeating: 0, count: width * height * 3)
     for y in 0..<height {
         for x in 0..<width {
+            let pixel = syntheticPixel(x: x, y: y, width: width, height: height)
             let index = (y * width + x) * 3
-            pixels[index] = Float(x) / Float(width)
-            pixels[index + 1] = Float(y) / Float(height)
-            pixels[index + 2] = Float((x ^ y) & 255) / 255
+            pixels[index] = pixel.x
+            pixels[index + 1] = pixel.y
+            pixels[index + 2] = pixel.z
         }
     }
     let image = RGBImage(width: width, height: height, pixels: pixels)

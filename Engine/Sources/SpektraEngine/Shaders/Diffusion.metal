@@ -28,7 +28,7 @@ kernel void diffusion_psf(device float *psf [[buffer(0)]],
 
 // `channel` of the image reduced by `scale` (each scale × scale block's mean, the last ones
 // smaller), extended by `radius` pixels on each side, mirrored about the edge pixels (np.pad's
-// `reflect`), from index 0; 0 past it.
+// `reflect`, which repeats a single row or column), from index 0; 0 past it.
 kernel void diffusion_pad(texture2d<float, access::read> image [[texture(0)]],
                           device float *signal [[buffer(0)]],
                           constant uint2 &size [[buffer(1)]],
@@ -41,8 +41,8 @@ kernel void diffusion_pad(texture2d<float, access::read> image [[texture(0)]],
     int x = int(gid.x) - radius, y = int(gid.y) - radius;
     float value = 0.0f;
     if (x < width + radius && y < height + radius) {
-        x = x < 0 ? -x : (x >= width ? 2 * (width - 1) - x : x);
-        y = y < 0 ? -y : (y >= height ? 2 * (height - 1) - y : y);
+        x = width == 1 ? 0 : (x < 0 ? -x : (x >= width ? 2 * (width - 1) - x : x));
+        y = height == 1 ? 0 : (y < 0 ? -y : (y >= height ? 2 * (height - 1) - y : y));
         int x1 = min((x + 1) * scale, fullWidth), y1 = min((y + 1) * scale, fullHeight);
         for (int j = y * scale; j < y1; j++) {
             for (int i = x * scale; i < x1; i++) {

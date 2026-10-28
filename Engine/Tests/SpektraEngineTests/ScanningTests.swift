@@ -89,7 +89,8 @@ func halfFloatIntermediatesMatchFullFloats(caseName: String) throws {
 
 /// The LUT creator's QA oracle: ΔE2000 between this chain and Python on its 50k random sRGB
 /// samples, read as its metric reads them (clipped to [0, 1], sRGB → XYZ → L*a*b* under D65).
-@Test(arguments: ["kodak_portra_400-kodak_portra_endura", "kodak_vision3_500t-kodak_2383"])
+@Test(arguments: ["kodak_portra_400-kodak_portra_endura", "kodak_vision3_500t-kodak_2383"]
+               + chartOnlyPairs.filter { !$0.hasSuffix("-scan") })
 func qaOracleDeltaE(pair: String) throws {
     let caseName = "qa-\(pair)"
     let golden = try GoldenCase(caseName)

@@ -49,11 +49,31 @@ swift test -c release -Xswiftc -enable-testing --package-path Engine
 Optimized, they take about a minute on an M1 Pro instead of six; `-enable-testing` keeps the `@testable import` they
 rely on. The app has no tests of its own, so a pull request says what you tried in it.
 
+### Runtime checks
+
+The tests check what the engine computes, not how it reaches memory: a read past the end of a value, a data race
+between threads or a shader reading outside a buffer can work on one Mac and fail on another. Before a release, and
+after changing a kernel's arguments (what a `setBytes` passes, or a struct a kernel reads), run the tests under
+Xcode's three runtime checks. Each should pass with no reports:
+
+```sh
+# Metal API and shader validation: about a minute
+MTL_SHADER_VALIDATION=1 MTL_DEBUG_LAYER=1 swift test -c release -Xswiftc -enable-testing --package-path Engine
+# Address Sanitizer: about 20 minutes
+swift test --sanitize=address -Xswiftc -enable-testing --package-path Engine
+# Thread Sanitizer: about 20 minutes
+swift test --sanitize=thread -Xswiftc -enable-testing --package-path Engine
+```
+
+The sanitizers build unoptimized, hence the time. Under validation, Core Image prints `Error creating PSO for the uber
+shader: ci_ubershader_r4` about 140 times: that's Core Image's own shader, not the engine's, and expected. These cover
+the engine only; the app's own code has no tests to run them on.
+
 ### Reference data
 
 The parity tests compare every stage against dumps from the original Python Spektrafilm, at commit `3bb2c2d`, in
 `golden/<case>/`: one float32 `.npy` per pipeline tap, the film's spectral lookup table and the parameters used.
-The dumps (about 230 MB) aren't in the repository; make them with that Spektrafilm, installed as the README's
+The dumps (about 550 MB) aren't in the repository; make them with that Spektrafilm, installed as the README's
 [Faithful to Spektrafilm](README.md#faithful-to-spektrafilm) says:
 
 ```sh
@@ -84,6 +104,13 @@ ported stage should still match, or differ only by what the tests measure and al
 say by how much in the pull request. If it changes a step's speed or result, regenerate
 [docs/porting.md](docs/porting.md)'s table and images with `tools/port_report.py`, and say why in its text if the step
 now works differently. Anything meant to render differently from Spektrafilm starts with an issue.
+
+Before a pull request that touches the engine's speed or memory, run `tools/benchmark.sh` on an idle Mac (about five
+minutes). It times the README's renders and the saves of a 50 and a 100 MP photo, with and without a diffusion filter,
+and fails, naming the row, when a time is more than 15 % slower or a peak more than 10 % higher than
+`tools/benchmark-baseline.tsv`. Put its table in the pull request. The committed baseline is the maintainer's MacBook
+Pro (M1 Pro, 16 GB): on another Mac, record your own on `main` first with `tools/benchmark.sh --update`, and don't
+commit it. A change that makes renders faster or leaner on purpose records the new baseline in the same pull request.
 
 ## Code
 

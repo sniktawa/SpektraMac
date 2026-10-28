@@ -1,0 +1,12 @@
+# tools/benchmark.sh's baseline: row, time (ms), peak memory footprint (MB, saves only).
+# MacBookPro18,3, Apple M1 Pro, 16 GB; macOS 27.0.1 (26A434); commit 475c531
+Full render, 2400 × 1600	69	-
+Preview, 1600 × 1067	19	-
+Full render, 6000 × 4000	404	-
+Full render, 6960 × 4640	571	-
+Save 50 MP, no diffusion	1531	9189
+Save 50 MP, lens diffusion	1801	10388
+Save 50 MP, enlarger diffusion	1821	10429
+Save 100 MP, no diffusion	4345	15352
+Save 100 MP, lens diffusion	5649	17239
+Save 100 MP, enlarger diffusion	5347	15923

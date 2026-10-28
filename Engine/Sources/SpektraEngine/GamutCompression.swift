@@ -159,6 +159,9 @@ struct OutputCompressionConstants {
     var fL, nBB, whiteA, cz: Float
     var k, kN, fLQuarter, whiteLightness: Float
     var hueStart, hueStep: Float
+    /// The Metal struct's tail padding: its size rounds up to its 16-byte alignment (176 bytes), so
+    /// this value is as long as what the kernel reads.
+    var padding = SIMD2<Float>.zero
 }
 
 extension GPU {
@@ -168,7 +171,7 @@ extension GPU {
                                  on encoder: Encoder, rgb: any MTLTexture) -> any MTLTexture {
         var constants = compression.kernelConstants
         encode("compress_cam16ucs", on: encoder, textures: [rgb, rgb], grid: rgb.size) {
-            $0.setBytes(&constants, length: MemoryLayout<OutputCompressionConstants>.stride, index: 0)
+            $0.setBytes(&constants, length: MemoryLayout<OutputCompressionConstants>.size, index: 0)
             $0.setBuffer(maxChroma, offset: 0, index: 1)
         }
         return rgb

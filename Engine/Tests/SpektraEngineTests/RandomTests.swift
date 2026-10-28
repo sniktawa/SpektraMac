@@ -15,7 +15,7 @@ import Testing
             Random random(20260515, 7, gid);
             // x: Poisson λ; y: lognormal σ (μ = −σ²/2, so the mean is 1); z: uniform.
             float sigma = parameters.y;
-            output.write(float4(float(random.poisson(parameters.x)), random.lognormal(-sigma * sigma / 2.0f, sigma),
+            output.write(float4(random.poisson(parameters.x), random.lognormal(-sigma * sigma / 2.0f, sigma),
                                 random.uniform(), 0.0f), gid);
         }
         """
