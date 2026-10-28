@@ -39,6 +39,8 @@ final class PhotoModel {
             stripControls = nil
             original = nil
             showsOriginal = false
+            lastFinishedRender = nil
+            cropAspect = .free
             scheduleRender()
         }
     }
@@ -54,8 +56,14 @@ final class PhotoModel {
     var controls = Controls() {
         didSet {
             showsFilm = controls.scanFilm
+            framing = controls.framing
             isSlideFilm = films.first { $0.stock == controls.film }?.type == .positive
-            scheduleRender()
+            // The framing is the canvas's to show, not the engine's to render: the thumbnail follows it.
+            if controls.unframed != oldValue.unframed {
+                scheduleRender()
+            } else if controls.framing != oldValue.framing {
+                scheduleFramedThumbnail()
+            }
             if controlsBeforeChange == nil && controls != oldValue {
                 registerUndo(from: oldValue)
             }
@@ -70,10 +78,16 @@ final class PhotoModel {
     @ObservationIgnored private var isApplyingPhotoControls = false
     /// Told each finished screen-size render of the open photo, for the library's thumbnails.
     @ObservationIgnored var onFinishedRender: ((URL, CGImage) -> Void)?
+    /// The open photo's last finished screen-size render, unframed: framed again for the thumbnail
+    /// when only the framing changes.
+    @ObservationIgnored private var lastFinishedRender: CGImage?
+    @ObservationIgnored private var framedThumbnailTask: Task<Void, Never>?
     /// What the toolbar's Print | Film switch shows, as the controls have it: apart from them, so
     /// the switch isn't laid out again at every step of a slider (setting an observed property to
     /// the value it has notifies no one).
     private(set) var showsFilm = false
+    /// How the canvas frames the photo, as the controls have it: apart from them for the same reason.
+    private(set) var framing = Framing()
     /// A slide is viewed, never printed: every paper is negative-working, so a printed slide
     /// comes out as a negative image.
     private(set) var isSlideFilm = false
@@ -86,7 +100,9 @@ final class PhotoModel {
     }
     /// What choosing `film` sets the controls to (``film``).
     func controls(choosing film: String) -> Controls {
-        savedDefaults(for: film) ?? factoryControls(for: film, from: controls)
+        var chosen = savedDefaults(for: film) ?? factoryControls(for: film, from: controls)
+        chosen.framing = controls.framing
+        return chosen
     }
     var filmName: String { filmName(of: controls) }
     func filmName(of controls: Controls) -> String { films.first { $0.stock == controls.film }?.name ?? controls.film }
@@ -287,7 +303,8 @@ final class PhotoModel {
     /// a moment), and one the engine is already opening shows until the later one replaces it.
     /// "Opening…" stays until the newest is done. An opened photo goes to the top of
     /// ``recentPhotos``.
-    func open(_ url: URL, controls photoControls: Controls? = nil) {
+    func open(_ url: URL, controls photoControls: Controls? = nil, placeholder: CGImage? = nil,
+              preloading neighbours: [URL] = []) {
         // Files from the Open panel and Open Recent are security-scoped; dropped files and those
         // sent by Finder or the Dock are already accessible.
         let scoped = url.startAccessingSecurityScopedResource()
@@ -295,6 +312,17 @@ final class PhotoModel {
         let generation = opensStarted
         isLoading = true
         errorMessage = nil
+        // The library's thumbnail until the photo renders, rather than the last photo.
+        if let placeholder {
+            stopRendering()
+            displayImage = placeholder
+        }
+        // Read before the neighbours are dropped, so stepping back and forth reuses them.
+        let preloaded = decodedPhotos[url] != nil
+        let decoding = decodedPhotos[url] ?? Self.decoding(url)
+        // This photo's too, so stepping back to it doesn't read it again.
+        decodedPhotos = decodedPhotos.filter { neighbours.contains($0.key) || $0.key == url }
+        decodedPhotos[url] = decoding
         Task {
             defer { if scoped { url.stopAccessingSecurityScopedResource() } }
             defer {
@@ -302,11 +330,10 @@ final class PhotoModel {
                     isLoading = false
                 }
             }
+            let start = ContinuousClock.now
             do {
                 let engine = try await makingEngine.value
-                let (image, metadata) = try await Task.detached(priority: .userInitiated) {
-                    (try RGBImage.decode(contentsOf: url), PhotoMetadata(contentsOf: url))
-                }.value
+                let (image, metadata) = try await decoding.value
                 guard generation == opensStarted else { return }
                 // The engine opens the photo once it's done rendering the last one: stop that.
                 stopRendering()
@@ -322,8 +349,8 @@ final class PhotoModel {
                     throw error
                 }
                 self.metadata = metadata
-                // The photo's own settings, if the library has them; otherwise the last ones carry
-                // over. Undo stays with the photo it was done on.
+                // The photo's own settings, if the library has them (or what an unedited one starts
+                // with); otherwise the last ones carry over. Undo stays with the photo it was done on.
                 undoManager?.removeAllActions()
                 if let photoControls, knowsStocks(of: photoControls) {
                     undoManager?.disableUndoRegistration()
@@ -335,11 +362,16 @@ final class PhotoModel {
                 photo = Photo(url: url, name: url.lastPathComponent, width: opened.width, height: opened.height,
                               previewWidth: opened.previewWidth, previewHeight: opened.previewHeight,
                               metering: opened.metering, meteringOverlays: opened.meteringOverlays)
-                note("Opened \(url.lastPathComponent) (\(opened.width) × \(opened.height))")
+                let elapsed = (ContinuousClock.now - start).formatted(.units(allowed: [.milliseconds]))
+                note("Opened \(url.lastPathComponent) (\(opened.width) × \(opened.height)) in \(elapsed)\(preloaded ? ", preloaded" : "")")
                 NSDocumentController.shared.noteNewRecentDocumentURL(url)
                 recentPhotos = NSDocumentController.shared.recentDocumentURLs
-                loadOriginal(of: url)
+                preload(neighbours)
+                // After the next photo, so stepping on quickly doesn't wait on reading this one again.
+                loadOriginal(of: url, after: neighbours.first.flatMap { decodedPhotos[$0] })
             } catch {
+                // Read again next time: the drive may be back.
+                decodedPhotos[url] = nil
                 // A photo chosen since says how it went instead.
                 guard generation == opensStarted else { return }
                 fail("Couldn't open “\(url.lastPathComponent)”", error, alert: true)
@@ -347,15 +379,44 @@ final class PhotoModel {
         }
     }
 
+    /// Photos decoded ahead of being opened (``preload(_:)``), and the one being opened.
+    @ObservationIgnored private var decodedPhotos: [URL: Task<(CIImage, PhotoMetadata?), Error>] = [:]
+
+    /// Decodes `url` in the background, after `previous` if given: the slow part of opening a large
+    /// TIFF from a network drive. At the priority of opening a photo, as each is one the user is
+    /// about to step to (a lower one took several times as long).
+    private static func decoding(_ url: URL, after previous: Task<(CIImage, PhotoMetadata?), Error>? = nil)
+        -> Task<(CIImage, PhotoMetadata?), Error> {
+        Task.detached(priority: .userInitiated) {
+            _ = try? await previous?.value
+            return (try RGBImage.decode(contentsOf: url), PhotoMetadata(contentsOf: url))
+        }
+    }
+
+    /// Starts decoding the photos next to the one just opened, one after the other in the order
+    /// given, so stepping to one opens it without reading its file. Keeps only these and the open one.
+    private func preload(_ neighbours: [URL]) {
+        let open = photo?.url
+        decodedPhotos = decodedPhotos.filter { neighbours.contains($0.key) || $0.key == open }
+        var previous: Task<(CIImage, PhotoMetadata?), Error>?
+        for url in neighbours where decodedPhotos[url] == nil {
+            let task = Self.decoding(url, after: previous)
+            decodedPhotos[url] = task
+            previous = task
+        }
+    }
+
     /// Reads `url` into ``original`` for the photo just opened, unless another opens meanwhile:
     /// after the photo shows, so it opens no later for it (0.05–0.45 s for 12–24 MP JPEG, HEIC and
     /// DNG files on an M1 Pro).
-    private func loadOriginal(of url: URL) {
+    private func loadOriginal(of url: URL, after preloading: Task<(CIImage, PhotoMetadata?), Error>? = nil) {
         let id = photo?.id
         // Files from the Open panel are security-scoped, and the opening task stops its access.
         let scoped = url.startAccessingSecurityScopedResource()
         Task {
             defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+            _ = try? await preloading?.value
+            guard photo?.id == id else { return }
             do {
                 let image = try await Task.detached(priority: .utility) { try Self.decodeOriginal(contentsOf: url) }.value
                 if photo?.id == id {
@@ -429,13 +490,13 @@ final class PhotoModel {
         isRendering = start == .reduced || start == .full
         isPreviewing = start == .preview
         renderTask = Task {
-            var controls = self.controls
+            var controls = self.controls.unframed
             do {
                 // Whether a kept finished render is on screen.
                 var isFinished = false
                 if start == .preview {
                     repeat {
-                        controls = self.controls
+                        controls = self.controls.unframed
                         isFinished = showKept(controls, photo: photo)
                         if !isFinished {
                             try await show(controls: controls, mode: .preview, engine: engine, photo: photo)
@@ -443,7 +504,7 @@ final class PhotoModel {
                         // With each preview, so the graph follows a slider or its own handles as
                         // they move.
                         toneGraph = (try await engine.toneGraph(controls: controls), controls)
-                    } while controls != self.controls
+                    } while controls != self.controls.unframed
                     isPreviewing = false
                     if isAdjusting && !isFinished {
                         awaitsRelease = true
@@ -519,7 +580,8 @@ final class PhotoModel {
         if case .reduced(let longSide) = mode {
             finishedRenders.setObject(display, forKey: RenderKey(controls: controls, longSide: longSide),
                                       cost: display.bytesPerRow * display.height)
-            onFinishedRender?(photo.url, display)
+            lastFinishedRender = display
+            onFinishedRender?(photo.url, self.controls.framing.apply(to: display))
         }
         let elapsed = (ContinuousClock.now - start).formatted(.units(allowed: [.milliseconds]))
         let size = mode == .full ? "\(photo.width) × \(photo.height)" : "\(display.width) × \(display.height)"
@@ -555,7 +617,7 @@ final class PhotoModel {
         let longSide: Int
 
         init(controls: Controls, longSide: Int) {
-            (self.controls, self.longSide) = (controls, longSide)
+            (self.controls, self.longSide) = (controls.unframed, longSide)
         }
 
         override func isEqual(_ object: Any?) -> Bool {
@@ -601,7 +663,7 @@ final class PhotoModel {
     /// frame is a render of its own, so a change's preview waits on one frame at most; each strip
     /// shows once all its frames are done.
     private func renderStrips(photo: Photo, engine: Engine) {
-        let controls = controls
+        let controls = controls.unframed
         guard controls != stripControls, stripTask == nil else { return }
         stripTask = Task {
             let start = ContinuousClock.now
@@ -743,7 +805,7 @@ final class PhotoModel {
                 defer { savePhase = nil; saveTask = nil }
                 let start = ContinuousClock.now
                 do {
-                    let image = try await engine.export(controls: controls, as: type)
+                    let image = try await Self.framed(engine.export(controls: controls, as: type), by: controls)
                     try Task.checkCancellation()
                     savePhase = "Writing \(url.lastPathComponent)…"
                     try await Task.detached(priority: .userInitiated) {
@@ -792,7 +854,8 @@ final class PhotoModel {
                         (try RGBImage.decode(contentsOf: job.url), PhotoMetadata(contentsOf: job.url))
                     }.value
                     _ = try await engine.open(image)
-                    let rendered = try await engine.export(controls: checked(job.controls), as: type)
+                    let rendered = try await Self.framed(engine.export(controls: checked(job.controls), as: type),
+                                                         by: job.controls)
                     let record = editRecord(for: job.controls)
                     let destination = Self.unusedURL(in: folder, name: job.name, extension: ext)
                     try await Task.detached(priority: .userInitiated) {
@@ -815,6 +878,13 @@ final class PhotoModel {
             open(url, controls: controls)
         }
         return written
+    }
+
+    /// `image`, a full-resolution render, turned and cropped as `controls` frame it, off the main actor.
+    private static func framed(_ image: CGImage, by controls: Controls) async -> CGImage {
+        let framing = controls.framing.checked
+        guard !framing.isIdentity else { return image }
+        return await Task.detached(priority: .userInitiated) { framing.apply(to: image) }.value
     }
 
     /// `name.ext` in `folder`, or `name 2.ext` and so on if that's taken.
@@ -844,7 +914,7 @@ final class PhotoModel {
         let engine = try await makingEngine.value
         let (controls, metadata, record) = (controls, metadata, editRecord)
         let start = ContinuousClock.now
-        let image = try await engine.export(controls: controls, as: .jpeg)
+        let image = try await Self.framed(engine.export(controls: controls, as: .jpeg), by: controls)
         let url = URL.temporaryDirectory.appending(path: UUID().uuidString).appending(path: "\(name).jpg")
         try await Task.detached(priority: .userInitiated) {
             try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -967,7 +1037,9 @@ final class PhotoModel {
                 ])
             }
             actionName = "Open Preset"
-            controls = checked(preset, from: url.lastPathComponent)
+            var opened = checked(preset, from: url.lastPathComponent)
+            opened.framing = controls.framing
+            controls = opened
             actionName = nil
             note("Opened preset \(url.lastPathComponent)")
         } catch {
@@ -1008,7 +1080,8 @@ final class PhotoModel {
     /// Makes the current controls what choosing this film applies from now on.
     func makeDefaultForFilm() {
         do {
-            try UserDefaults.standard.set(controls.preset(), forKey: Self.defaultsKey(controls.film))
+            // Not the framing: it's this photo's.
+            try UserDefaults.standard.set(controls.unframed.preset(), forKey: Self.defaultsKey(controls.film))
             note("Made these settings the default for \(filmName)")
         } catch {
             fail("Couldn't make these settings the default for \(filmName)", error, alert: true)
@@ -1020,7 +1093,9 @@ final class PhotoModel {
     func restoreFactoryDefaults() {
         setSavedDefaults(nil, for: controls.film)
         actionName = "Restore Factory Defaults"
-        controls = factoryControls(for: controls.film, from: Controls())
+        var factory = factoryControls(for: controls.film, from: Controls())
+        factory.framing = controls.framing
+        controls = factory
         actionName = nil
         // The defaults' undo, in the same step, has the name even if the controls were already these.
         undoManager?.setActionName("Restore Factory Defaults")
@@ -1039,6 +1114,18 @@ final class PhotoModel {
 
     private static func defaultsKey(_ film: String) -> String { "filmDefaults.\(film)" }
 
+    /// What a photo not edited yet opens with: the film and paper in use, and the rest from the
+    /// film's saved defaults or the app's own, rather than the last photo's edit.
+    func startingControls() -> Controls {
+        var start = UserDefaults.standard.data(forKey: Self.defaultsKey(controls.film))
+            .flatMap { try? Controls(preset: $0) } ?? Controls()
+        start.film = controls.film
+        start.paper = controls.paper
+        start.scanFilm = controls.scanFilm
+        start.framing = Framing()
+        return checked(start)
+    }
+
     private func savedDefaults(for film: String) -> Controls? {
         guard let preset = UserDefaults.standard.data(forKey: Self.defaultsKey(film)) else { return nil }
         do {
@@ -1054,6 +1141,7 @@ final class PhotoModel {
     /// Print | Film switch has it. Says in the log what it changed, if `source` names the preset.
     private func checked(_ controls: Controls, from source: String? = nil) -> Controls {
         var checked = controls.clampedToRanges()
+        checked.framing = checked.framing.checked
         if films.first(where: { $0.stock == controls.film })?.type == .positive {
             checked.scanFilm = true
         }
@@ -1129,7 +1217,10 @@ final class PhotoModel {
         case "paper": "Paper"
         case "scanFilm": "Print or Film"
         case "exposureMark", "exposureOffsetEV", "highlightBoost": "Exposure"
-        case "printExposure", "yFilterShift", "mFilterShift", "preflash": "Enlarger"
+        case "printExposure", "yFilterShift", "mFilterShift": "Enlarger"
+        case let name where name.hasPrefix("preflash"): "Enlarger"
+        case let name where name.hasPrefix("vignette"): "Vignette"
+        case let name where name.hasPrefix("scan") && name != "scanFilm": "Scanned Print"
         case "printContrast", "printHighlightContrast", "printShadowContrast": "Contrast"
         case "cameraDiffusion": "Lens Diffusion"
         case "enlargerDiffusion": "Enlarger Diffusion"
@@ -1138,15 +1229,103 @@ final class PhotoModel {
         case let name where name.hasPrefix("halation") || name.hasPrefix("scatter"): "Halation"
         case let name where name.hasPrefix("coupler"): "Couplers"
         case let name where name.hasPrefix("grain"): "Grain"
+        case "rotation": "Rotate"
+        case "straighten": "Straighten"
+        case let name where name.hasPrefix("crop"): "Crop"
         default: "Settings"
+        }
+    }
+
+    // MARK: Framing
+
+    /// The Crop tab is open: the canvas shows the whole turned photo, the crop drawn over it.
+    var isCropping = false
+    /// The shape the crop is held to, and whether upright, so its long side is its height.
+    private(set) var cropAspect = CropAspect.free
+    private(set) var cropIsPortrait = false
+
+    /// The open photo's size in pixels, as it was shot.
+    var photoSize: CGSize { photo.map { CGSize(width: $0.width, height: $0.height) } ?? .zero }
+
+    /// Turns the photo a quarter, its crop with it, and the crop's shape.
+    func rotate(clockwise: Bool) {
+        controls.framing = controls.framing.turned(clockwise: clockwise)
+        if cropAspect.ratio(photo: photoSize) != nil {
+            cropIsPortrait.toggle()
+        }
+    }
+
+    /// Straight, uncropped and as shot, in one undo step.
+    func resetFraming() {
+        actionName = "Reset Crop"
+        controls.framing = Framing()
+        actionName = nil
+        cropAspect = .free
+    }
+
+    /// The crop's shape as a ratio of its fractions of the turned photo (width over height): what
+    /// the crop tool holds it to, nil if it's free.
+    var cropFractionRatio: CGFloat? {
+        guard let ratio = cropAspect.ratio(photo: photoSize) else { return nil }
+        let turned = controls.framing.turnedSize(of: photoSize)
+        guard turned.width > 0 else { return nil }
+        return (cropIsPortrait ? 1 / ratio : ratio) * turned.height / turned.width
+    }
+
+    /// Picks `aspect` for the crop, upright if the crop is now taller than wide.
+    func chooseCropAspect(_ aspect: CropAspect) {
+        let size = controls.framing.croppedSize(of: photoSize)
+        if aspect == .original {
+            // The photo's own shape, as it's turned.
+            let turned = controls.framing.turnedSize(of: photoSize)
+            cropIsPortrait = turned.height > turned.width
+        } else if cropAspect == .free || cropAspect == .original {
+            cropIsPortrait = size.height > size.width
+        }
+        cropAspect = aspect
+        fitCropToAspect()
+    }
+
+    /// Swaps the crop's shape between wide and tall.
+    func toggleCropOrientation() {
+        cropIsPortrait.toggle()
+        fitCropToAspect()
+    }
+
+    /// The largest crop of the chosen shape within the photo, around the crop's centre.
+    private func fitCropToAspect() {
+        guard let ratio = cropFractionRatio else { return }
+        var width = min(1, ratio), height = width / ratio
+        if height > 1 { (width, height) = (ratio, 1) }
+        let crop = controls.framing.crop
+        let x = min(max(crop.midX - width / 2, 0), 1 - width)
+        let y = min(max(crop.midY - height / 2, 0), 1 - height)
+        let fitted = CGRect(x: x, y: y, width: width, height: height)
+        if fitted != crop {
+            controls.framing.crop = fitted
+        }
+    }
+
+    /// Frames the last render again for the library's thumbnail, once the framing pauses.
+    private func scheduleFramedThumbnail() {
+        framedThumbnailTask?.cancel()
+        guard let render = lastFinishedRender, let url = photo?.url else { return }
+        framedThumbnailTask = Task {
+            try? await Task.sleep(for: .milliseconds(300))
+            guard !Task.isCancelled, photo?.url == url else { return }
+            let framing = controls.framing
+            let framed = await Task.detached(priority: .utility) { framing.apply(to: render) }.value
+            guard !Task.isCancelled else { return }
+            onFinishedRender?(url, framed)
         }
     }
 
     // MARK: Adjustments
 
     /// The settings' groups, as Photos groups its adjustments: each resets on its own.
-    enum Adjustment {
-        case exposure, cameraDiffusion, halation, couplers, grain, contrast, enlarger, burn, enlargerDiffusion, glare
+    enum Adjustment: String, CaseIterable, Codable {
+        case stocks, exposure, cameraDiffusion, halation, couplers, grain, contrast, enlarger, vignette, burn, enlargerDiffusion, glare,
+             scanLook, crop
     }
 
     /// Whether `adjustment`'s controls are what choosing the film applies.
@@ -1165,51 +1344,88 @@ final class PhotoModel {
     private func resetting(_ adjustment: Adjustment, in controls: Controls) -> Controls {
         let defaults = UserDefaults.standard.data(forKey: Self.defaultsKey(controls.film))
             .flatMap { try? Controls(preset: $0) }.map { checked($0) } ?? Controls()
-        var reset = controls
-        switch adjustment {
-        case .exposure:
-            reset.exposureMark = defaults.exposureMark
-            reset.exposureOffsetEV = defaults.exposureOffsetEV
-            reset.highlightBoost = defaults.highlightBoost
-        case .cameraDiffusion:
-            reset.cameraDiffusion = defaults.cameraDiffusion
-        case .halation:
-            reset.halation = defaults.halation
-            reset.halationAmount = defaults.halationAmount
-            reset.halationSize = defaults.halationSize
-            reset.scatterAmount = defaults.scatterAmount
-            reset.scatterSize = defaults.scatterSize
-        case .couplers:
-            reset.couplers = defaults.couplers
-            reset.couplerSaturation = defaults.couplerSaturation
-            reset.couplerEdgeContrast = defaults.couplerEdgeContrast
-        case .grain:
-            reset.grain = defaults.grain
-            reset.grainSize = defaults.grainSize
-            reset.grainSoftness = defaults.grainSoftness
-        case .contrast:
-            reset.printContrast = defaults.printContrast
-            reset.printHighlightContrast = defaults.printHighlightContrast
-            reset.printShadowContrast = defaults.printShadowContrast
-        case .enlarger:
-            reset.printExposure = defaults.printExposure
-            reset.yFilterShift = defaults.yFilterShift
-            reset.mFilterShift = defaults.mFilterShift
-            reset.preflash = defaults.preflash
-        case .burn:
-            reset.burn = defaults.burn
-            reset.burnStops = defaults.burnStops
-            reset.burnThreshold = defaults.burnThreshold
-        case .enlargerDiffusion:
-            reset.enlargerDiffusion = defaults.enlargerDiffusion
-        case .glare:
-            reset.glare = defaults.glare
-            reset.glareAmount = defaults.glareAmount
-            reset.glareRoughness = defaults.glareRoughness
-            reset.glareSoftness = defaults.glareSoftness
-        }
-        return reset
+        return Self.copying([adjustment], from: defaults, into: controls)
     }
+
+    /// `target` with `groups`' controls from `source`: for a reset, pasting edits or a preset that
+    /// keeps only some groups.
+    static func copying(_ groups: Set<Adjustment>, from source: Controls, into target: Controls) -> Controls {
+        var copy = target
+        for group in groups {
+            switch group {
+            case .stocks:
+                copy.film = source.film
+                copy.paper = source.paper
+                copy.scanFilm = source.scanFilm
+            case .exposure:
+                copy.exposureMark = source.exposureMark
+                copy.exposureOffsetEV = source.exposureOffsetEV
+                copy.highlightBoost = source.highlightBoost
+            case .cameraDiffusion:
+                copy.cameraDiffusion = source.cameraDiffusion
+            case .halation:
+                copy.halation = source.halation
+                copy.halationAmount = source.halationAmount
+                copy.halationSize = source.halationSize
+                copy.scatterAmount = source.scatterAmount
+                copy.scatterSize = source.scatterSize
+            case .couplers:
+                copy.couplers = source.couplers
+                copy.couplerSaturation = source.couplerSaturation
+                copy.couplerEdgeContrast = source.couplerEdgeContrast
+            case .grain:
+                copy.grain = source.grain
+                copy.grainSize = source.grainSize
+                copy.grainSoftness = source.grainSoftness
+            case .contrast:
+                copy.printContrast = source.printContrast
+                copy.printHighlightContrast = source.printHighlightContrast
+                copy.printShadowContrast = source.printShadowContrast
+            case .enlarger:
+                copy.printExposure = source.printExposure
+                copy.yFilterShift = source.yFilterShift
+                copy.mFilterShift = source.mFilterShift
+                copy.preflash = source.preflash
+                copy.preflashYFilterShift = source.preflashYFilterShift
+                copy.preflashMFilterShift = source.preflashMFilterShift
+            case .vignette:
+                copy.vignette = source.vignette
+                copy.vignetteStops = source.vignetteStops
+                copy.vignetteMidpoint = source.vignetteMidpoint
+                copy.vignetteSoftness = source.vignetteSoftness
+            case .burn:
+                copy.burn = source.burn
+                copy.burnStops = source.burnStops
+                copy.burnThreshold = source.burnThreshold
+            case .enlargerDiffusion:
+                copy.enlargerDiffusion = source.enlargerDiffusion
+            case .glare:
+                copy.glare = source.glare
+                copy.glareAmount = source.glareAmount
+                copy.glareRoughness = source.glareRoughness
+                copy.glareSoftness = source.glareSoftness
+            case .scanLook:
+                copy.scanLook = source.scanLook
+                copy.scanBlackLevel = source.scanBlackLevel
+                copy.scanShadowHue = source.scanShadowHue
+                copy.scanShadowAmount = source.scanShadowAmount
+                copy.scanShadowRange = source.scanShadowRange
+            case .crop:
+                copy.framing = source.framing
+            }
+        }
+        return copy
+    }
+
+    /// Sets the controls to `new` (checked as a preset is), as one undo step named `name`.
+    func apply(_ new: Controls, named name: String) {
+        actionName = name
+        controls = checked(new)
+        actionName = nil
+    }
+
+    /// `controls` brought within the app's ranges and stocks, as a preset is when opened.
+    func checkedControls(_ controls: Controls) -> Controls { checked(controls) }
 
     // MARK: Helpers
 

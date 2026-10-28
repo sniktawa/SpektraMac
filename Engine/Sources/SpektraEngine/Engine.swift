@@ -29,11 +29,31 @@ public struct Controls: Codable, Sendable, Hashable {
     /// A flash of the bare enlarger light on the paper before the print, as a fraction of the
     /// clear film base's exposure: it darkens light tones more than white or the shadows.
     public var preflash = 0.0
+    /// The preflash's own filters, in CC away from the print's neutral ones, which tint what it
+    /// adds to the light tones (not Spektrafilm's controls, but its parameters).
+    public var preflashYFilterShift = 0.0
+    public var preflashMFilterShift = 0.0
+    /// Burning the print's edges in (positive stops), or dodging them for a reverse vignette
+    /// (negative), as a darkroom printer does with a hand or a card (not Spektrafilm's): `vignetteMidpoint`
+    /// is how far out from the centre the change is half done, from 0 to the corners at 1, and
+    /// `vignetteSoftness` how wide its fade is.
+    public var vignette = false
+    public var vignetteStops = 1.0
+    public var vignetteMidpoint = 0.6
+    public var vignetteSoftness = 0.6
     /// Burning in what's bright, such as a sky, as a darkroom printer does: extra enlarger exposure,
     /// in stops, where the film's exposure is over `burnThreshold` stops above mid-grey.
     public var burn = false
     public var burnStops = 1.0
     public var burnThreshold = 2.5
+    /// The look of a print scanned on a flatbed (not Spektrafilm's): blacks lifted to
+    /// `scanBlackLevel` (a fraction of white) and colour pushed into the shadows, of hue
+    /// `scanShadowHue` in degrees, by `scanShadowAmount`, up through `scanShadowRange` of the tones.
+    public var scanLook = false
+    public var scanBlackLevel = 0.01
+    public var scanShadowHue = 200.0
+    public var scanShadowAmount = 0.3
+    public var scanShadowRange = 0.5
     /// The paper's contrast, as a multiplier of its curves' gamma around mid-grey; and of its
     /// light tones' alone (its fastest sub-layer's) and its dark tones' (the others').
     public var printContrast = 1.0
@@ -68,12 +88,32 @@ public struct Controls: Codable, Sendable, Hashable {
     public var cameraDiffusion = Parameters.DiffusionFilter()
     /// The same on the enlarger's lens, over the print.
     public var enlargerDiffusion = Parameters.DiffusionFilter()
+    /// The photo's framing, applied to the render rather than in it (not Spektrafilm's): turned
+    /// `rotation` quarter turns clockwise, straightened by `straighten` degrees clockwise, zoomed in
+    /// so no corner shows, then cropped to `crop…`, fractions of the turned photo's width and height
+    /// from its top left.
+    public var rotation = 0
+    public var straighten = 0.0
+    public var cropX = 0.0
+    public var cropY = 0.0
+    public var cropWidth = 1.0
+    public var cropHeight = 1.0
 
     public init() {}
 
-    /// Reads a preset.
+    /// Reads a preset. Settings it has no value for, such as those added since it was saved, keep
+    /// their defaults.
     public init(preset: Data) throws {
-        self = try JSONDecoder().decode(Controls.self, from: preset)
+        let defaults = try JSONSerialization.jsonObject(with: Controls().preset())
+        let stored = try JSONSerialization.jsonObject(with: preset)
+        let merged = try JSONSerialization.data(withJSONObject: Self.merging(stored, over: defaults))
+        self = try JSONDecoder().decode(Controls.self, from: merged)
+    }
+
+    /// `stored` over `defaults`, key by key in nested objects.
+    private static func merging(_ stored: Any, over defaults: Any) -> Any {
+        guard let stored = stored as? [String: Any], let defaults = defaults as? [String: Any] else { return stored }
+        return defaults.merging(stored) { merging($1, over: $0) }
     }
 
     /// The controls as a preset: JSON, readable and with sorted keys so presets diff cleanly.
@@ -102,6 +142,15 @@ public struct Controls: Codable, Sendable, Hashable {
             \.yFilterShift: filterShift,
             \.mFilterShift: filterShift,
             \.preflash: 0...0.05,
+            \.preflashYFilterShift: filterShift,
+            \.preflashMFilterShift: filterShift,
+            \.vignetteStops: -3...3,
+            \.vignetteMidpoint: 0.1...1,
+            \.vignetteSoftness: 0.05...1,
+            \.scanBlackLevel: 0...0.1,
+            \.scanShadowHue: 0...360,
+            \.scanShadowAmount: 0...1,
+            \.scanShadowRange: 0.05...1,
             // The tone graph's burn line's whole way: the threshold stays within its −6…+6 stops.
             \.burnStops: 0...3,
             \.burnThreshold: 0...6,
@@ -128,6 +177,11 @@ public struct Controls: Codable, Sendable, Hashable {
             \.enlargerDiffusion.strength: diffusionStrength,
             \.enlargerDiffusion.spatialScale: diffusionSize,
             \.enlargerDiffusion.haloWarmth: diffusionWarmth,
+            \.straighten: -45...45,
+            \.cropX: 0...0.95,
+            \.cropY: 0...0.95,
+            \.cropWidth: 0.05...1,
+            \.cropHeight: 0.05...1,
         ]
     }()
 
@@ -816,6 +870,14 @@ public actor Engine {
         parameters.enlarger.yFilterShift = controls.yFilterShift
         parameters.enlarger.mFilterShift = controls.mFilterShift
         parameters.enlarger.preflashExposure = controls.preflash
+        parameters.enlarger.preflashYFilterShift = controls.preflashYFilterShift
+        parameters.enlarger.preflashMFilterShift = controls.preflashMFilterShift
+        parameters.enlarger.vignette = controls.vignette && controls.vignetteStops != 0
+            ? Parameters.Vignette(stops: controls.vignetteStops, midpoint: controls.vignetteMidpoint,
+                                  softness: controls.vignetteSoftness) : nil
+        parameters.scanner.look = controls.scanLook
+            ? Parameters.ScanLook(blackLevel: controls.scanBlackLevel, shadowHue: controls.scanShadowHue,
+                                  shadowAmount: controls.scanShadowAmount, shadowRange: controls.scanShadowRange) : nil
         parameters.enlarger.burn = controls.burn
             ? Parameters.Burn(stops: controls.burnStops, threshold: controls.burnThreshold) : nil
         // Off at 1: Python's default, which the morph at 1 renders identically.

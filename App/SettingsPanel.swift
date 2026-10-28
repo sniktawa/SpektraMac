@@ -4,9 +4,9 @@ import SwiftUI
 // MARK: - Settings
 
 /// The steps of the process the settings are in, one at a time, chosen in the toolbar over the
-/// panel: the camera's exposure, the film, and the print made from it.
+/// panel: the camera's exposure, the film, and the print made from it; and the saved presets.
 enum SettingsCategory: String, CaseIterable {
-    case camera = "Camera", film = "Film", print = "Print"
+    case camera = "Camera", film = "Film", print = "Print", crop = "Crop", presets = "Presets"
 }
 
 /// The settings of one step of the process, laid out as Photos' Adjust panel: a group per effect.
@@ -74,6 +74,9 @@ struct SettingsPanel: View {
                                     format: .number.precision(.fractionLength(2)), unit: "px")
                             .help("The blur over the grain, in pixels of the render.")
                     }
+                case .presets, .crop:
+                    // Shown in place of this panel (``PresetsPanel``, ``CropPanel``).
+                    EmptyView()
                 case .print:
                     if model.controls.scanFilm {
                         Text(model.isSlideFilm
@@ -119,6 +122,33 @@ struct SettingsPanel: View {
                             ValueSlider("Preflash", value: $model.controls.preflash, in: Controls.range(\.preflash), step: 0.001,
                                         format: .number.precision(.fractionLength(3)))
                                 .help("A flash of plain light on the paper before the print, so light tones such as a bright sky gain some tone. It darkens the whole print: lower the print exposure to bring the mid-tones back.")
+                            ValueSlider("Preflash Y tint", value: $model.controls.preflashYFilterShift,
+                                        in: Controls.range(\.preflashYFilterShift), step: 1, neutral: 0,
+                                        format: .number.precision(.fractionLength(0)).sign(strategy: .always(includingZero: false)),
+                                        unit: "CC")
+                                .help("The yellow filter for the preflash alone, away from the print's: more tints the light tones blue, less yellow.")
+                                .disabled(model.controls.preflash == 0)
+                            ValueSlider("Preflash M tint", value: $model.controls.preflashMFilterShift,
+                                        in: Controls.range(\.preflashMFilterShift), step: 1, neutral: 0,
+                                        format: .number.precision(.fractionLength(0)).sign(strategy: .always(includingZero: false)),
+                                        unit: "CC")
+                                .help("The magenta filter for the preflash alone, away from the print's: more tints the light tones green, less magenta.")
+                                .disabled(model.controls.preflash == 0)
+                        }
+                        AdjustmentGroup("Vignette", systemImage: "circle.dashed", adjustment: .vignette,
+                                        isOn: $model.controls.vignette) {
+                            ValueSlider("Strength", value: $model.controls.vignetteStops, in: Controls.range(\.vignetteStops),
+                                        step: 0.1, neutral: 0,
+                                        format: .number.precision(.fractionLength(1)).sign(strategy: .always(includingZero: false)),
+                                        unit: "EV")
+                                .help("Burning the print's edges in (more) as a darkroom printer does, or holding them back for a reverse vignette (less), which lightens them.")
+                        } options: {
+                            ValueSlider("Midpoint", value: $model.controls.vignetteMidpoint, in: Controls.range(\.vignetteMidpoint),
+                                        step: 0.01, format: .number.precision(.fractionLength(2)))
+                                .help("How far out from the centre the vignette is half done: 1 is at the corners.")
+                            ValueSlider("Softness", value: $model.controls.vignetteSoftness, in: Controls.range(\.vignetteSoftness),
+                                        step: 0.01, format: .number.precision(.fractionLength(2)))
+                                .help("How gradually the vignette fades in: as a hand or card moved during the exposure.")
                         }
                         AdjustmentGroup("Burn", systemImage: "sun.horizon", adjustment: .burn, isOn: $model.controls.burn) {
                             ValueSlider("Strength", value: $model.controls.burnStops, in: Controls.range(\.burnStops), step: 0.1,
@@ -148,6 +178,22 @@ struct SettingsPanel: View {
                         }
                     }
                     .disabled(model.controls.scanFilm)
+                    AdjustmentGroup("Scanned print", systemImage: "scanner", adjustment: .scanLook,
+                                    isOn: $model.controls.scanLook) {
+                        ValueSlider("Shadow colour", value: $model.controls.scanShadowAmount, in: Controls.range(\.scanShadowAmount),
+                                    step: 0.01, format: .number.precision(.fractionLength(2)))
+                            .help("How far the shadows are pushed towards the colour below, as a flatbed scan of a print tints them.")
+                        ValueSlider("Hue", value: $model.controls.scanShadowHue, in: Controls.range(\.scanShadowHue),
+                                    step: 1, format: .number.precision(.fractionLength(0)), unit: "°")
+                            .help("The shadows' colour: 0 red, 60 yellow, 120 green, 180 cyan, 240 blue, 300 magenta.")
+                    } options: {
+                        ValueSlider("Black level", value: $model.controls.scanBlackLevel, in: Controls.range(\.scanBlackLevel),
+                                    step: 0.001, format: .number.precision(.fractionLength(3)))
+                            .help("How far the blacks are lifted, as a scanner sees a print's deepest black as a dark grey. It takes the shadows' colour.")
+                        ValueSlider("Shadow range", value: $model.controls.scanShadowRange, in: Controls.range(\.scanShadowRange),
+                                    step: 0.01, format: .number.precision(.fractionLength(2)))
+                            .help("How far up the tones the shadow colour reaches.")
+                    }
                 }
             }
             .padding(.vertical)
@@ -636,7 +682,7 @@ extension Parameters.DiffusionFilter.Family {
 /// keys step it. With Increase Contrast, the fill and the line are stronger. SwiftUI's `Slider`
 /// can't be restyled (there's no slider style to conform to), so the bar is drawn here, with the
 /// system slider standing in for VoiceOver, reading the value as the bar shows it.
-private struct ValueSlider: View {
+struct ValueSlider: View {
     let title: String
     @Binding var value: Double
     let range: ClosedRange<Double>

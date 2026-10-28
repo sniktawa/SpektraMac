@@ -67,7 +67,8 @@ final class LibraryModel {
 
     var step: WorkflowStep = .importing
     private(set) var projectName = "Default Project"
-    private(set) var items: [LibraryItem] = []
+    /// Set only here, and by pasting edits and applying presets (Presets.swift).
+    var items: [LibraryItem] = []
     var selection: Set<LibraryItem.ID> = []
     /// The photo open in Edit.
     private(set) var currentID: LibraryItem.ID?
@@ -77,10 +78,15 @@ final class LibraryModel {
     var thumbnailSize: Double = 180
     private(set) var thumbnails: [LibraryItem.ID: CGImage] = [:]
     /// What the library is doing, for the status bar.
-    private(set) var status = ""
+    var status = ""
     private(set) var isImporting = false
 
     let photos: PhotoModel
+    let presets = PresetLibrary()
+    /// The edits Copy Edits took, for Paste.
+    var copiedEdits: (controls: Controls, groups: Set<PhotoModel.Adjustment>)?
+    /// The Copy Edits or Save Preset sheet, while it's up.
+    var groupsSheet: GroupsSheet?
     /// Where the project is saved: the default project in the app's own folder until one is chosen.
     private var projectURL: URL
     @ObservationIgnored private var resolvedURLs: [LibraryItem.ID: URL] = [:]
@@ -128,8 +134,13 @@ final class LibraryModel {
         }
         currentID = item.id
         selection = [item.id]
-        let controls = item.controlsPreset.flatMap { try? Controls(preset: $0) }
-        photos.open(url, controls: controls)
+        let controls = item.controlsPreset.flatMap { try? Controls(preset: $0) } ?? photos.startingControls()
+        // The next photo first, as photos are mostly stepped through forwards.
+        let shown = shownItems
+        let neighbours = shown.firstIndex(where: { $0.id == item.id }).map { index in
+            [index + 1, index - 1].filter(shown.indices.contains).compactMap { self.url(of: shown[$0]) }
+        } ?? []
+        photos.open(url, controls: controls, placeholder: thumbnails[item.id], preloading: neighbours)
         step = .edit
     }
 
@@ -530,7 +541,7 @@ final class LibraryModel {
     }
 
     /// Saves a moment after the last change, so a slider's drag writes once.
-    private func scheduleSave() {
+    func scheduleSave() {
         guard !saveScheduled else { return }
         saveScheduled = true
         Task {

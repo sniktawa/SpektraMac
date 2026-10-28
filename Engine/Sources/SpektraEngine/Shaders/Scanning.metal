@@ -14,6 +14,23 @@ kernel void scan_xyz(texture2d<float, access::read> cmy [[texture(0)]],
     output.write(float4(fmax(xyz, 0.0f) + 1e-10f, 1.0f), gid);
 }
 
+// The scanned-print look (not Spektrafilm's), in linear output RGB: the shadows pushed towards
+// `tint` (luminance 1) by `look.y`, fading out by lightness `look.z`, then the blacks lifted to
+// `look.x` of white, in the tint's colour as far as the shadows take it. `luma` is the space's Y row.
+kernel void scan_look(texture2d<float, access::read> input [[texture(0)]],
+                      texture2d<float, access::write> output [[texture(1)]],
+                      constant float3 &look [[buffer(0)]],
+                      constant float3 &tint [[buffer(1)]],
+                      constant float3 &luma [[buffer(2)]],
+                      uint2 gid [[thread_position_in_grid]]) {
+    float3 rgb = input.read(gid).rgb;
+    float y = fmax(dot(rgb, luma), 0.0f);
+    float shadow = 1.0f - smoothstep(0.0f, look.z, pow(y, 1.0f / 2.4f));
+    rgb = mix(rgb, y * tint, look.y * shadow);
+    rgb = look.x * mix(float3(1.0f), tint, look.y) + (1.0f - look.x) * rgb;
+    output.write(float4(rgb, 1.0f), gid);
+}
+
 // compute_random_glare_amount before its blur: per pixel a lognormal sample exp(μ + σ z)
 // (fast_lognormal) / 100, in all three channels.
 kernel void glare_lognormal(texture2d<float, access::write> output [[texture(0)]],

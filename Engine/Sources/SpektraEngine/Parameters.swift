@@ -20,6 +20,18 @@ public struct Parameters: Codable, Sendable, Equatable {
         public var lensBlur = 0.0
         /// σ in pixels, amount; either 0 is off.
         public var unsharpMask = [0.7, 0.7]
+        /// Not Spektrafilm's: `nil` there and in the golden data, as when off.
+        public var look: ScanLook?
+    }
+
+    /// A flatbed scan of a print (not Spektrafilm's): the blacks lifted to `blackLevel` of white,
+    /// and the shadows pushed towards a colour of hue `shadowHue` (degrees) by `shadowAmount`, up
+    /// through `shadowRange` of the tones (in lightness, 0 to 1). The lifted black takes the colour too.
+    public struct ScanLook: Codable, Sendable, Equatable {
+        public var blackLevel: Double
+        public var shadowHue: Double
+        public var shadowAmount: Double
+        public var shadowRange: Double
     }
 
     public struct Camera: Codable, Sendable, Equatable {
@@ -175,6 +187,8 @@ extension Parameters {
         public var preflashMFilterShift = 0.0
         /// Not Spektrafilm's, which has no burn: `nil` there and in the golden data, as when off.
         public var burn: Burn?
+        /// Not Spektrafilm's either, nil when off.
+        public var vignette: Vignette?
 
         /// The filters the print is exposed through: neutral plus the user's shifts.
         var printFilters: SIMD3<Double> {
@@ -193,6 +207,15 @@ extension Parameters {
     public struct Burn: Codable, Sendable, Equatable {
         public var stops: Double
         public var threshold: Double
+    }
+
+    /// A darkroom printer's edge burn (positive `stops`) or dodge (negative, a reverse vignette):
+    /// that much more or less print exposure towards the edges, half of it at `midpoint` (0 at the
+    /// centre, 1 at the corners), fading over `softness` of the way.
+    public struct Vignette: Codable, Sendable, Equatable {
+        public var stops: Double
+        public var midpoint: Double
+        public var softness: Double
     }
 
     /// `apply_database_neutral_print_filters`: the C, M, Y filters that print a grey neutral for

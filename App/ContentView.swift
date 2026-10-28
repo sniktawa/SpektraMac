@@ -7,7 +7,6 @@ struct ContentView: View {
     @Environment(PhotoModel.self) private var model
     @Environment(LibraryModel.self) private var library
     @Environment(\.openWindow) private var openWindow
-    @Environment(\.undoManager) private var undoManager
     @SceneStorage("showsSettings") private var showsSettings = true
     @SceneStorage("settingsCategory") private var category = SettingsCategory.film
     @FocusState private var isCanvasFocused: Bool
@@ -49,26 +48,37 @@ struct ContentView: View {
             // shows through the inspector's glass when zoomed or moved under it (``ImageCanvas``),
             // as the inspector lies over the canvas rather than beside it.
             .inspector(isPresented: $showsSettings) {
-                SettingsPanel(category: category)
-                    // Greyed out while the canvas shows the original: they set the edit.
-                    .disabled(model.showsOriginal)
-                    .inspectorColumnWidth(290)
-                    // In the inspector's own part of the toolbar, so centred over the panel.
-                    .toolbar {
-                        ToolbarSpacer(.flexible)
-                        ToolbarItem {
-                            Picker("Settings", selection: $category) {
-                                ForEach(SettingsCategory.allCases, id: \.self) { Text($0.rawValue) }
-                            }
-                            .pickerStyle(.segmented)
-                        }
-                        ToolbarSpacer(.flexible)
+                VStack(spacing: 0) {
+                    // In the panel rather than the inspector's part of the toolbar, which drops it
+                    // into the toolbar's overflow menu when the window is narrow.
+                    Picker("Settings", selection: $category) {
+                        ForEach(SettingsCategory.allCases, id: \.self) { Text($0.rawValue) }
                     }
-            }
-            .onChange(of: undoManager, initial: true) { _, undoManager in
-                model.undoManager = undoManager
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .padding(.horizontal, 15)
+                    .padding(.top, 8)
+                    .padding(.bottom, 2)
+                    Group {
+                        if category == .presets {
+                            PresetsPanel()
+                        } else if category == .crop {
+                            CropPanel()
+                                .disabled(model.showsOriginal)
+                        } else {
+                            SettingsPanel(category: category)
+                                // Greyed out while the canvas shows the original: they set the edit.
+                                .disabled(model.showsOriginal)
+                        }
+                    }
+                    .frame(maxHeight: .infinity, alignment: .top)
+                }
+                .inspectorColumnWidth(290)
             }
             // For the View menu (``ViewCommands``).
+            .onChange(of: category == .crop && showsSettings, initial: true) { _, cropping in
+                model.isCropping = cropping
+            }
             .focusedSceneValue(\.settingsCategory, $category)
             .focusedSceneValue(\.showsSettings, $showsSettings)
             .dropDestination(for: URL.self) { urls, _ in
@@ -81,11 +91,6 @@ struct ContentView: View {
             case .success(let url): model.openPreset(url)
             case .failure(let error): model.importFailed(error)
             }
-        }
-        .alert(model.failure?.title ?? "", isPresented: Binding { model.failure != nil } set: { if !$0 { model.failure = nil } },
-               presenting: model.failure) { _ in
-        } message: { failure in
-            Text(failure.message)
         }
     }
 
@@ -239,12 +244,18 @@ private struct ImageCanvas: View {
                 // photo would make that the window's minimum.
                 GeometryReader { _ in
                     let fitted = fittedSize(in: visibleSize)
-                    Image(model.showsOriginal ? model.original ?? image : image, scale: 1, label: Text(photoDescription))
+                    let size = CGSize(width: fitted.width * zoom, height: fitted.height * zoom)
+                    framed(Image(model.showsOriginal ? model.original ?? image : image, scale: 1, label: Text(photoDescription))
                         .resizable()
                         .interpolation(.high)
                         .overlay { meteringOverlay }
-                        .overlay { burnOverlay }
-                        .frame(width: fitted.width * zoom, height: fitted.height * zoom)
+                        .overlay { burnOverlay }, size: size)
+                        .overlay {
+                            if model.isCropping {
+                                CropOverlay(size: size)
+                            }
+                        }
+                        .frame(width: size.width, height: size.height)
                         .position(x: visibleCentre.x + offset.width, y: visibleCentre.y + offset.height)
                 }
                 .contentShape(Rectangle())
@@ -255,7 +266,7 @@ private struct ImageCanvas: View {
                         offset = clamped(CGSize(width: start.width + drag.translation.width,
                                                 height: start.height + drag.translation.height))
                     }
-                    .onEnded { _ in dragStart = nil })
+                    .onEnded { _ in dragStart = nil }, isEnabled: !model.isCropping)
                 .simultaneousGesture(MagnifyGesture()
                     .onChanged { pinch in
                         // Pinched shut, the magnification reaches 0, and 0 over 0 would make the
@@ -264,10 +275,11 @@ private struct ImageCanvas: View {
                         zoom(by: pinch.magnification / pinched, at: pinch.startLocation)
                         pinched = pinch.magnification
                     }
-                    .onEnded { _ in pinched = 1 })
+                    .onEnded { _ in pinched = 1 }, isEnabled: !model.isCropping)
                 // Each click of a double-click is a click too: it switches twice, so it ends on
                 // the view it started from.
                 .onTapGesture {
+                    guard !model.isCropping else { return }
                     if model.original != nil {
                         model.showsOriginal.toggle()
                     }
@@ -291,7 +303,7 @@ private struct ImageCanvas: View {
                     // photo, scrolling zooms instead of scrolling. A trackpad's momentum after
                     // the fingers lift is left out, so the zoom stops with them.
                     scrollMonitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { event in
-                        guard let pointer else { return event }
+                        guard let pointer, !model.isCropping else { return event }
                         if event.momentumPhase.isEmpty {
                             let step = event.hasPreciseScrollingDeltas ? 0.01 : 0.15  // points, or wheel lines
                             zoom(by: exp(event.scrollingDeltaY * step), at: pointer)
@@ -318,8 +330,17 @@ private struct ImageCanvas: View {
             zoom = 1
             offset = .zero
         }
+        // The crop tool shows all of the photo; the framing changes its shape, so the zoom starts over.
+        .onChange(of: model.isCropping) {
+            zoom = 1
+            offset = .zero
+        }
+        .onChange(of: model.framing.quarterTurns) {
+            zoom = 1
+            offset = .zero
+        }
         .focusedSceneValue(\.canvasZoom, model.photo == nil ? nil : CanvasZoom(
-            zoomIn: zoom < maxZoom ? { zoom(by: 2, at: visibleCentre) } : nil,
+            zoomIn: zoom < maxZoom && !model.isCropping ? { zoom(by: 2, at: visibleCentre) } : nil,
             zoomOut: zoom > 1 ? { zoom(by: 0.5, at: visibleCentre) } : nil,
             fit: zoom > 1 ? { zoom = 1; offset = .zero } : nil))
         .onChange(of: fittedLongSide, initial: true) { _, pixels in
@@ -378,24 +399,60 @@ private struct ImageCanvas: View {
     /// The photo's size scaled to fit `size`, with a margin: the photo's own shape, whichever
     /// render is shown, so swapping renders can't move it.
     private func fittedSize(in size: CGSize) -> CGSize {
-        guard let photo = model.photo else { return .zero }
-        let inset: CGFloat = 12
-        let scale = max(0, min((size.width - 2 * inset) / CGFloat(photo.width),
-                               (size.height - 2 * inset) / CGFloat(photo.height)))
-        return CGSize(width: CGFloat(photo.width) * scale, height: CGFloat(photo.height) * scale)
+        let shown = shownSize
+        guard shown.width > 0, shown.height > 0 else { return .zero }
+        let inset: CGFloat = model.isCropping ? 28 : 12
+        let scale = max(0, min((size.width - 2 * inset) / shown.width, (size.height - 2 * inset) / shown.height))
+        return CGSize(width: shown.width * scale, height: shown.height * scale)
     }
 
-    /// The fitted photo's long side in screen pixels.
+    /// The framing the canvas shows: all of the turned photo while cropping.
+    private var shownFraming: Framing {
+        var framing = model.framing
+        if model.isCropping {
+            framing.crop = Framing.whole
+        }
+        return framing
+    }
+
+    /// The photo's size in its pixels as the canvas frames it.
+    private var shownSize: CGSize { shownFraming.croppedSize(of: model.photoSize) }
+
+    /// `content`, the whole photo, turned, straightened and cropped as the canvas frames it, at `size`.
+    private func framed(_ content: some View, size: CGSize) -> some View {
+        let framing = shownFraming
+        let photoSize = model.photoSize
+        let turned = framing.turnedSize(of: photoSize)
+        // Points per photo pixel.
+        let scale = turned.width > 0 ? size.width / (framing.crop.width * turned.width) : 0
+        return content
+            .frame(width: photoSize.width * scale, height: photoSize.height * scale)
+            .rotationEffect(.degrees(Double(framing.quarterTurns) * 90 + framing.straighten))
+            .scaleEffect(framing.straightenScale(for: turned))
+            .frame(width: turned.width * scale, height: turned.height * scale)
+            .offset(x: (0.5 - framing.crop.midX) * turned.width * scale, y: (0.5 - framing.crop.midY) * turned.height * scale)
+            .frame(width: size.width, height: size.height)
+            .clipped()
+    }
+
+    /// The long side the whole photo renders at so what the canvas shows of it fills its screen
+    /// pixels: more than the fitted size where it's cropped or straightened.
     private var fittedLongSide: Int {
         let fitted = fittedSize(in: visibleSize)
-        return Int((max(fitted.width, fitted.height) * displayScale).rounded(.up))
+        let shown = shownSize, photoSize = model.photoSize
+        let framing = shownFraming
+        let longSide = max(fitted.width, fitted.height) * displayScale
+        guard shown.width > 0 else { return Int(longSide.rounded(.up)) }
+        let whole = longSide * max(photoSize.width, photoSize.height) / max(shown.width, shown.height)
+            * framing.straightenScale(for: framing.turnedSize(of: photoSize))
+        return Int(min(whole, max(photoSize.width, photoSize.height)).rounded(.up))
     }
 
     /// The most the photo zooms: 4 points per photo pixel.
     private var maxZoom: CGFloat {
         let fitted = fittedSize(in: visibleSize)
-        guard let photo = model.photo, fitted.width > 0 else { return 1 }
-        return max(1, 4 * CGFloat(photo.width) / fitted.width)
+        guard model.photo != nil, fitted.width > 0 else { return 1 }
+        return max(1, 4 * shownSize.width / fitted.width)
     }
 
     /// Zooms by `factor`, keeping the photo's point under `anchor` (canvas coordinates) where it

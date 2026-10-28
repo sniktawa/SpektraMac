@@ -445,6 +445,9 @@ extension Simulation {
         var burnStops = burnMask == nil ? 0 : Float(parameters.enlarger.burn?.stops ?? 0)
         // The filter spreads the exposure itself, so the kernel leaves the log to after it.
         var linear = UInt32(filter.active ? 1 : 0)
+        let vignette = parameters.enlarger.vignette
+        var vignetteValues = SIMD3<Float>(Float(vignette?.stops ?? 0), Float(vignette?.midpoint ?? 0),
+                                          Float(vignette?.softness ?? 0))
         gpu.encode("print_exposure", on: encoder, textures: [cmy, output, burnMask ?? cmy], grid: output.size) {
             $0.setBytes(printFilmBands, length: printFilmBands.count * MemoryLayout<SIMD4<Float>>.stride, index: 0)
             $0.setBytes(printPaperBands, length: printPaperBands.count * MemoryLayout<SIMD4<Float>>.stride, index: 1)
@@ -453,6 +456,7 @@ extension Simulation {
             $0.setBytes(&preflash, length: MemoryLayout<SIMD3<Float>>.size, index: 4)
             $0.setBytes(&linear, length: 4, index: 5)
             $0.setBytes(&burnStops, length: 4, index: 6)
+            $0.setBytes(&vignetteValues, length: MemoryLayout<SIMD3<Float>>.size, index: 7)
         }
         guard filter.active else { return output }
         gpu.encodeLogExposure(on: encoder, input: gpu.encodeDiffusionFilter(on: encoder, input: output, filter: filter,
@@ -531,8 +535,31 @@ extension Simulation {
     /// `cmy_print` (or `cmy_film` when scanning film) → `rgb_out` (ScanningStage.scan): to linear
     /// output RGB, gamut compression, the scanner's lens blur and unsharp mask, and encoding.
     public func encodeScan(_ cmy: any MTLTexture, on encoder: Encoder) -> any MTLTexture {
-        let rgb = encodeOutputCompression(encodeDensityToRGB(cmy, on: encoder), on: encoder)
+        let rgb = encodeScanLook(encodeOutputCompression(encodeDensityToRGB(cmy, on: encoder), on: encoder),
+                                 on: encoder)
         return encodeOutputEncoding(encodeScannerOptics(rgb, on: encoder), on: encoder)
+    }
+
+    /// The scanned-print look (``Parameters/ScanLook``, not Spektrafilm's), in place in `rgb`.
+    public func encodeScanLook(_ rgb: any MTLTexture, on encoder: Encoder) -> any MTLTexture {
+        guard let look = parameters.scanner.look else { return rgb }
+        let luma = SIMD3<Double>(outputColourSpace.rgbToXYZ[1])
+        // The hue at 60% saturation in the output space, scaled to luminance 1.
+        let hue = look.shadowHue.truncatingRemainder(dividingBy: 360) / 60
+        let channel = { (n: Double) in
+            let k = (n + hue).truncatingRemainder(dividingBy: 6)
+            return 1 - max(0, min(k, 4 - k, 1))
+        }
+        let colour = SIMD3<Double>(repeating: 0.4) + 0.6 * SIMD3(channel(5), channel(3), channel(1))
+        var tint = SIMD3<Float>(colour / (colour * luma).sum())
+        var values = SIMD3<Float>(Float(look.blackLevel), Float(look.shadowAmount), Float(look.shadowRange))
+        var lumaValues = SIMD3<Float>(luma)
+        gpu.encode("scan_look", on: encoder, textures: [rgb, rgb], grid: rgb.size) {
+            $0.setBytes(&values, length: MemoryLayout<SIMD3<Float>>.size, index: 0)
+            $0.setBytes(&tint, length: MemoryLayout<SIMD3<Float>>.size, index: 1)
+            $0.setBytes(&lumaValues, length: MemoryLayout<SIMD3<Float>>.size, index: 2)
+        }
+        return rgb
     }
 
     /// `cmy_print` (or `cmy_film` when scanning film) → linear RGB in the output colour space

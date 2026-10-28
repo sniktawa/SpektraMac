@@ -5,6 +5,7 @@ import UniformTypeIdentifiers
 /// The window: Import › Edit › Export in the toolbar's middle, and the step's own view below.
 struct WorkspaceView: View {
     @Environment(LibraryModel.self) private var library
+    @Environment(\.undoManager) private var undoManager
 
     var body: some View {
         Group {
@@ -20,6 +21,18 @@ struct WorkspaceView: View {
             }
         }
         .frame(minWidth: 820, minHeight: 560)
+        .sheet(item: Bindable(library).groupsSheet) { GroupsSheetView(purpose: $0) }
+        // Here rather than in Edit, so pasting edits and presets in Import can be undone too.
+        .onChange(of: undoManager, initial: true) { _, undoManager in
+            library.photos.undoManager = undoManager
+        }
+        // Here rather than in Edit, so what fails in Import or Export says so too.
+        .alert(library.photos.failure?.title ?? "",
+               isPresented: Binding { library.photos.failure != nil } set: { if !$0 { library.photos.failure = nil } },
+               presenting: library.photos.failure) { _ in
+        } message: { failure in
+            Text(failure.message)
+        }
     }
 }
 
@@ -166,6 +179,17 @@ struct LibraryView: View {
         let ids = library.selection.contains(item.id) ? library.selection : [item.id]
         Button("Edit") { library.edit(item) }
         Button("Show in Finder") { library.showInFinder(ids) }
+        Divider()
+        Button("Copy Edits") { library.selection = ids; library.copyEdits() }
+            .disabled(ids.count != 1)
+        Button("Paste Edits") { library.selection = ids; library.pasteEdits() }
+            .disabled(library.copiedEdits == nil)
+        Menu("Apply Preset") {
+            ForEach(library.presets.presets) { preset in
+                Button(preset.name) { library.selection = ids; library.applyPreset(preset) }
+            }
+        }
+        .disabled(library.presets.presets.isEmpty)
         Divider()
         Button("Reset Settings") { library.resetSettings(ids) }
             .disabled(!library.items.contains { ids.contains($0.id) && $0.isEdited })
@@ -361,7 +385,7 @@ struct ExportView: View {
                     Text(result).foregroundStyle(.secondary)
                 }
             } footer: {
-                Text("Each photo renders at full resolution with its own settings. Photos you haven't edited use the settings last used in Edit.")
+                Text("Each photo renders at full resolution with its own settings. Photos you haven't edited use the film's default settings.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -399,7 +423,7 @@ struct ExportView: View {
 
     private func export() {
         guard let folder else { chooseFolder(); return }
-        let fallback = photos.controls
+        let fallback = photos.startingControls()
         let list: [PhotoModel.ExportJob] = jobs.compactMap { item in
             guard let url = library.url(of: item) else { return nil }
             let controls = item.controlsPreset.flatMap { try? Controls(preset: $0) } ?? fallback

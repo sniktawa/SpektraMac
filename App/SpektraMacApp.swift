@@ -53,6 +53,25 @@ struct SpektraMacApp: App {
                 Button("Next Photo") { library.editNeighbour(1) }
                     .keyboardShortcut(.rightArrow, modifiers: .command)
                     .disabled(library.step != .edit)
+                Divider()
+                Button("Copy Edits") { library.copyEdits() }
+                    .keyboardShortcut("c", modifiers: [.command, .shift])
+                    .disabled(!library.canCopyEdits)
+                Button("Copy Some Edits…") { library.groupsSheet = .copy }
+                    .keyboardShortcut("c", modifiers: [.command, .shift, .option])
+                    .disabled(!library.canCopyEdits)
+                Button("Paste Edits") { library.pasteEdits() }
+                    .keyboardShortcut("v", modifiers: [.command, .shift])
+                    .disabled(!library.canPasteEdits)
+                Divider()
+                Button("Rotate Left") { model.rotate(clockwise: false) }
+                    .keyboardShortcut("[", modifiers: .command)
+                    .disabled(library.step != .edit || model.photo == nil || model.showsOriginal)
+                Button("Rotate Right") { model.rotate(clockwise: true) }
+                    .keyboardShortcut("]", modifiers: .command)
+                    .disabled(library.step != .edit || model.photo == nil || model.showsOriginal)
+                Button("Reset Crop & Rotation") { model.resetFraming() }
+                    .disabled(library.step != .edit || model.photo == nil || model.framing.isIdentity)
             }
             // The user guide on GitHub: there's no help book.
             CommandGroup(replacing: .help) {
@@ -61,10 +80,21 @@ struct SpektraMacApp: App {
             }
             CommandMenu("Preset") {
                 Group {
-                    Button("Open Preset…") { model.isImportingPreset = true }
-                        .keyboardShortcut("o", modifiers: [.command, .shift])
-                    Button("Save Preset…") { model.savePreset() }
+                    Button("New Preset…") { library.groupsSheet = .savePreset }
                         .keyboardShortcut("s", modifiers: [.command, .shift])
+                    Menu("Apply Preset") {
+                        ForEach(library.presets.presets) { preset in
+                            Button(preset.name) { library.applyPreset(preset) }
+                        }
+                    }
+                    .disabled(library.presets.presets.isEmpty || !library.canApplyPreset)
+                    Divider()
+                    Button("Import Presets…") { library.presets.importPresets() }
+                    Button("Show Presets Folder") { library.presets.showInFinder() }
+                    Divider()
+                    Button("Open Preset File…") { model.isImportingPreset = true }
+                        .keyboardShortcut("o", modifiers: [.command, .shift])
+                    Button("Export Preset File…") { model.savePreset() }
                     Divider()
                     Button("Make Default for \(model.filmName)") { model.makeDefaultForFilm() }
                     Button("Restore Factory Defaults") { model.restoreFactoryDefaults() }
@@ -108,7 +138,7 @@ struct ViewCommands: Commands {
             Divider()
             ForEach(Array(SettingsCategory.allCases.enumerated()), id: \.element) { index, tab in
                 // Choosing a tab shows the settings, if they're hidden.
-                Toggle("\(tab.rawValue) Settings", isOn: Binding { showsSettings?.wrappedValue == true && category?.wrappedValue == tab } set: { _ in
+                Toggle(tab == .presets || tab == .crop ? tab.rawValue : "\(tab.rawValue) Settings", isOn: Binding { showsSettings?.wrappedValue == true && category?.wrappedValue == tab } set: { _ in
                     category?.wrappedValue = tab
                     showsSettings?.wrappedValue = true
                 })

@@ -19,7 +19,9 @@ inline float3 spectral_transmission(float3 density, constant float4 *bands, cons
 // or with `linear`, before the log (for the enlarger's diffusion filter).
 //
 // The burn isn't Spektrafilm's: `burn_stops` more where `burn_mask` (.r) is 1, as much less as it
-// is under. At 0 stops the mask isn't read and the print is Spektrafilm's to the bit.
+// is under. At 0 stops the mask isn't read and the print is Spektrafilm's to the bit. Nor is the
+// vignette (`vignette`: stops, midpoint, softness): that many stops more towards the edges (fewer
+// for a reverse vignette), by the distance from the centre, 1 at the corners.
 kernel void print_exposure(texture2d<float, access::read> cmy [[texture(0)]],
                            texture2d<float, access::write> output [[texture(1)]],
                            texture2d<float, access::read> burn_mask [[texture(2)]],
@@ -30,12 +32,19 @@ kernel void print_exposure(texture2d<float, access::read> cmy [[texture(0)]],
                            constant float3 &preflash [[buffer(4)]],
                            constant uint &linear [[buffer(5)]],
                            constant float &burn_stops [[buffer(6)]],
+                           constant float3 &vignette [[buffer(7)]],
                            uint2 gid [[thread_position_in_grid]]) {
     float3 raw = spectral_transmission(cmy.read(gid).rgb, film_bands, paper_bands, band_count);
     raw = fmax(raw * factors.x + preflash, 0.0f) + 1e-10f;
     float3 exposure = raw * factors.y;
     if (burn_stops != 0.0f) {
         exposure *= exp2(burn_stops * saturate(burn_mask.read(gid).r));
+    }
+    if (vignette.x != 0.0f) {
+        float2 size = float2(output.get_width(), output.get_height());
+        float distance = length((float2(gid) + 0.5f) / size * 2.0f - 1.0f) * M_SQRT1_2_F;
+        float half_width = 0.5f * vignette.z;
+        exposure *= exp2(vignette.x * smoothstep(vignette.y - half_width, vignette.y + half_width, distance));
     }
     output.write(float4(linear ? exposure : log10(fmax(exposure, 0.0f) + 1e-10f), 1.0f), gid);
 }
